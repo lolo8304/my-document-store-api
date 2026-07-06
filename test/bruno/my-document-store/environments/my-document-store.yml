@@ -1,0 +1,6 @@
+name: my-document-store
+variables:
+  - name: api_key
+    value: a800b18842ba8626b0fcf685e12c02866e229ec304a97ece8807d9af71ce8c10
+  - name: operational-setup-key
+    value: 49ee1c7e191a1d9665f679922435ed4f7c02d337e7221a39fcdcf4486f7cdc87
