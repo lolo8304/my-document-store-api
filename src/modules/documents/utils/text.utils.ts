@@ -46,7 +46,36 @@ export function chunkText(text: string, size = 1000, overlap = 150): string[] {
   return chunks;
 }
 
-export function buildExcerpt(text: string, terms: string[], length = 260): string {
+export function mergeOverlappingChunks(chunks: string[], minOverlap = 20, maxOverlap = 250): string {
+  return chunks.reduce((merged, chunk) => {
+    const current = chunk.trim();
+    if (!current) {
+      return merged;
+    }
+    if (!merged) {
+      return current;
+    }
+
+    const overlap = findOverlapLength(merged, current, minOverlap, maxOverlap);
+    return `${merged}${current.slice(overlap)}`;
+  }, '');
+}
+
+function findOverlapLength(previous: string, current: string, minOverlap: number, maxOverlap: number): number {
+  const maxLength = Math.min(previous.length, current.length, maxOverlap);
+  const normalizedPrevious = previous.toLowerCase();
+  const normalizedCurrent = current.toLowerCase();
+
+  for (let length = maxLength; length >= minOverlap; length -= 1) {
+    if (normalizedPrevious.endsWith(normalizedCurrent.slice(0, length))) {
+      return length;
+    }
+  }
+
+  return 0;
+}
+
+export function buildExcerpt(text: string, terms: string[], length = 160): string {
   const lower = text.toLowerCase();
   const firstMatch = terms
     .map((term) => lower.indexOf(term.toLowerCase()))
@@ -56,4 +85,34 @@ export function buildExcerpt(text: string, terms: string[], length = 260): strin
   const start = Math.max((firstMatch ?? 0) - 80, 0);
   const excerpt = text.slice(start, start + length).trim();
   return `${start > 0 ? '...' : ''}${excerpt}${start + length < text.length ? '...' : ''}`;
+}
+
+export function buildMultiTermExcerpt(texts: string[], terms: string[], length = 160): string {
+  const uniqueTerms = Array.from(new Set(terms.filter(Boolean)));
+  if (uniqueTerms.length <= 1) {
+    return buildExcerpt(texts[0] ?? '', uniqueTerms, length);
+  }
+
+  const availableTerms = uniqueTerms.filter((term) => texts.some((text) => text.toLowerCase().includes(term.toLowerCase())));
+  if (availableTerms.length === 0) {
+    return buildExcerpt(texts[0] ?? '', uniqueTerms, length);
+  }
+
+  const separator = ' ... ';
+  const snippetLength = Math.max(24, Math.floor((length - separator.length * (availableTerms.length - 1)) / availableTerms.length));
+  const snippets = availableTerms.map((term) => buildTermSnippet(texts, term, snippetLength));
+  const excerpt = Array.from(new Set(snippets)).join(separator);
+  return excerpt.length <= length ? excerpt : excerpt.slice(0, length).trim();
+}
+
+function buildTermSnippet(texts: string[], term: string, length: number): string {
+  const lowerTerm = term.toLowerCase();
+  const text = texts.find((candidate) => candidate.toLowerCase().includes(lowerTerm)) ?? texts[0] ?? '';
+  const lowerText = text.toLowerCase();
+  const matchIndex = Math.max(lowerText.indexOf(lowerTerm), 0);
+  const termEnd = matchIndex + term.length;
+  const start = Math.max(Math.min(matchIndex - 8, text.length - length), 0);
+  const end = Math.min(Math.max(start + length, termEnd + 8), text.length);
+  const snippet = text.slice(start, end).trim();
+  return `${start > 0 ? '...' : ''}${snippet}${end < text.length ? '...' : ''}`;
 }

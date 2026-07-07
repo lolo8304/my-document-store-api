@@ -14,7 +14,7 @@ import { DocumentChunk } from './schemas/document-chunk.schema';
 import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
 import { SyncProgressEvent, SyncProgressGateway } from './sync-progress.gateway';
-import { buildExcerpt, buildPartialTerms, chunkText, normalizeTerms } from './utils/text.utils';
+import { buildExcerpt, buildMultiTermExcerpt, buildPartialTerms, chunkText, mergeOverlappingChunks, normalizeTerms } from './utils/text.utils';
 
 class SyncStoppedError extends Error {
   constructor() {
@@ -79,7 +79,7 @@ export class DocumentsService {
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
-          excerpt: text.length > 320 ? `${text.slice(0, 320)}...` : text,
+          excerpt: text.length > 160 ? `${text.slice(0, 160)}...` : text,
           matchedTerms: [],
           textUrl: `/documents/${document._id}/text`,
           pdfUrl: document.pdfUrl,
@@ -108,7 +108,7 @@ export class DocumentsService {
 
     return {
       documentId: id,
-      text: chunks.map((chunk) => chunk.text).join('\n\n'),
+      text: mergeOverlappingChunks(chunks.map((chunk) => chunk.text)),
     };
   }
 
@@ -771,6 +771,7 @@ export class DocumentsService {
         $group: {
           _id: '$metadataId',
           chunk: { $first: '$$ROOT' },
+          chunks: { $push: '$$ROOT' },
           bestMatchCount: { $max: '$matchCount' },
         },
       },
@@ -837,6 +838,7 @@ export class DocumentsService {
         $group: {
           _id: '$metadataId',
           chunk: { $first: '$$ROOT' },
+          chunks: { $push: '$$ROOT' },
           score: { $max: '$score' },
         },
       },
@@ -871,18 +873,22 @@ export class DocumentsService {
 
     return results.reduce<SearchResultItem[]>((items, result) => {
         const chunk = result.chunk;
+        const chunks = result.chunks ?? [chunk];
         const document = metadataById.get(String(result._id));
         if (!document) {
           return items;
         }
+        const matchedTerms: string[] = Array.from(
+          new Set<string>(chunks.flatMap((item: DocumentChunk & { matchedTerms?: string[] }) => item.matchedTerms ?? [])),
+        );
         items.push({
           documentId: String(document._id),
           fileName: document.fileName,
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
-          excerpt: buildExcerpt(chunk.text, terms),
-          matchedTerms: chunk.matchedTerms ?? terms.filter((term) => chunk.terms?.includes(term)),
+          excerpt: result.bestMatchCount ? buildMultiTermExcerpt(chunks.map((item: DocumentChunk) => item.text), terms) : buildExcerpt(chunk.text, terms),
+          matchedTerms: matchedTerms.length > 0 ? matchedTerms : terms.filter((term) => chunk.terms?.includes(term)),
           textUrl: `/documents/${document._id}/text`,
           pdfUrl: document.pdfUrl,
           score: result.score ?? result.bestMatchCount,
