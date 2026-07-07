@@ -14,7 +14,7 @@ import { DocumentChunk } from './schemas/document-chunk.schema';
 import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
 import { SyncProgressEvent, SyncProgressGateway } from './sync-progress.gateway';
-import { buildExcerpt, chunkText, normalizeTerms } from './utils/text.utils';
+import { buildExcerpt, buildPartialTerms, chunkText, normalizeTerms } from './utils/text.utils';
 
 class SyncStoppedError extends Error {
   constructor() {
@@ -217,6 +217,7 @@ export class DocumentsService {
         });
 
         if (existing) {
+          await this.ensureChunkPartialTerms(existing._id, existing.fileName);
           skipped += 1;
           current += 1;
           if (await this.isSyncStopRequested()) {
@@ -359,6 +360,41 @@ export class DocumentsService {
 
   async getDropboxDiagnostics() {
     return this.dropbox.getDiagnostics();
+  }
+
+  async migratePartialTerms(): Promise<{ scanned: number; updated: number }> {
+    const batchSize = 500;
+    let scanned = 0;
+    let updated = 0;
+
+    while (true) {
+      const chunks = await this.chunkModel
+        .find({
+          $or: [{ partialTerms: { $exists: false } }, { partialTerms: [] }],
+        })
+        .select('_id text fileName')
+        .limit(batchSize)
+        .lean();
+
+      if (chunks.length === 0) {
+        return { scanned, updated };
+      }
+
+      scanned += chunks.length;
+      const result = await this.chunkModel.bulkWrite(
+        chunks.map((chunk) => ({
+          updateOne: {
+            filter: { _id: chunk._id },
+            update: {
+              $set: {
+                partialTerms: Array.from(new Set([...buildPartialTerms(chunk.text), ...buildPartialTerms(chunk.fileName)])),
+              },
+            },
+          },
+        })),
+      );
+      updated += result.modifiedCount;
+    }
   }
 
   private async acquireSyncLock(): Promise<void> {
@@ -582,6 +618,7 @@ export class DocumentsService {
 
       await this.emitImportPhase('storing', sourceFile.name, counters, fileStartedAt);
       const fileNameTerms = normalizeTerms(sourceFile.name);
+      const fileNamePartialTerms = buildPartialTerms(sourceFile.name);
       await this.chunkModel.deleteMany({ metadataId: metadata._id });
       await this.chunkModel.insertMany(
         chunks.map((text, index) => ({
@@ -590,6 +627,7 @@ export class DocumentsService {
           chunkIndex: index,
           text,
           terms: Array.from(new Set([...normalizeTerms(text), ...fileNameTerms])),
+          partialTerms: Array.from(new Set([...buildPartialTerms(text), ...fileNamePartialTerms])),
           ...(vectorSearchEnabled ? { embedding: vectors[index] } : {}),
           deleted: false,
         })),
@@ -672,6 +710,34 @@ export class DocumentsService {
     return missingIds.length;
   }
 
+  private async ensureChunkPartialTerms(metadataId: Types.ObjectId, fileName: string): Promise<void> {
+    const chunks = await this.chunkModel
+      .find({
+        metadataId,
+        $or: [{ partialTerms: { $exists: false } }, { partialTerms: [] }],
+      })
+      .select('_id text')
+      .lean();
+
+    if (chunks.length === 0) {
+      return;
+    }
+
+    const fileNamePartialTerms = buildPartialTerms(fileName);
+    await this.chunkModel.bulkWrite(
+      chunks.map((chunk) => ({
+        updateOne: {
+          filter: { _id: chunk._id },
+          update: {
+            $set: {
+              partialTerms: Array.from(new Set([...buildPartialTerms(chunk.text), ...fileNamePartialTerms])),
+            },
+          },
+        },
+      })),
+    );
+  }
+
   private syncDate(file: DropboxPdfFile): Date | undefined {
     return file.serverModified ?? file.clientModified;
   }
@@ -684,28 +750,20 @@ export class DocumentsService {
     const terms = normalizeTerms(dto.q);
     const skip = (dto.page - 1) * dto.pageSize;
     const deletedFilter = dto.includeDeleted ? {} : { deleted: false };
-    const fileNameMatches = terms.map((term) => ({ fileName: { $regex: term, $options: 'i' } }));
 
     const pipeline: PipelineStage[] = [
-      { $match: { ...deletedFilter, $or: [{ terms: { $in: terms } }, ...fileNameMatches] } },
+      { $match: { ...deletedFilter, partialTerms: { $in: terms } } },
       {
         $addFields: {
-          textMatchedTerms: { $setIntersection: ['$terms', terms] },
-          fileNameMatchedTerms: {
+          matchedTerms: {
             $filter: {
               input: terms,
               as: 'term',
-              cond: {
-                $regexMatch: {
-                  input: { $toLower: '$fileName' },
-                  regex: '$$term',
-                },
-              },
+              cond: { $in: ['$$term', '$partialTerms'] },
             },
           },
         },
       },
-      { $addFields: { matchedTerms: { $setUnion: ['$textMatchedTerms', '$fileNameMatchedTerms'] } } },
       { $addFields: { matchCount: { $size: '$matchedTerms' } } },
       { $match: { matchCount: { $gt: 0 } } },
       { $sort: { matchCount: -1 as const, updatedAt: -1 as const } },

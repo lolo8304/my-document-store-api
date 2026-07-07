@@ -10,6 +10,21 @@ export function normalizeTerms(input: string): string[] {
   );
 }
 
+export function buildPartialTerms(input: string, minLength = 3, maxLength = 24): string[] {
+  return Array.from(
+    new Set(
+      normalizeTerms(input).flatMap((term) => {
+        const cappedLength = Math.min(term.length, maxLength);
+        const partials: string[] = [];
+        for (let length = minLength; length <= cappedLength; length += 1) {
+          partials.push(term.slice(0, length));
+        }
+        return partials;
+      }),
+    ),
+  );
+}
+
 export function chunkText(text: string, size = 1000, overlap = 150): string[] {
   const normalized = text.replace(/\s+/g, ' ').trim();
   if (!normalized) {

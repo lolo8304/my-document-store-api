@@ -1,0 +1,18 @@
+info:
+  name: migrate partial
+  type: http
+  seq: 3
+
+http:
+  method: POST
+  url: http://localhost:3000/admin/migrate/partial-terms
+  headers:
+    - name: api_key
+      value: "{{api_key}}"
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

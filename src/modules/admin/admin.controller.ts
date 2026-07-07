@@ -22,6 +22,11 @@ export class AdminController {
     return this.documents.stopDropboxSync();
   }
 
+  @Post('migrate/partial-terms')
+  migratePartialTerms() {
+    return this.documents.migratePartialTerms();
+  }
+
   @Get('dropbox')
   getDropboxDiagnostics() {
     return this.documents.getDropboxDiagnostics();
