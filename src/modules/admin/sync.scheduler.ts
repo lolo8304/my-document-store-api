@@ -5,6 +5,7 @@ import { DocumentsService } from '../documents/documents.service';
 @Injectable()
 export class SyncScheduler implements OnModuleInit {
   private readonly logger = new Logger(SyncScheduler.name);
+  private readonly defaultIntervalSeconds = 30 * 60;
 
   constructor(
     private readonly config: ConfigService,
@@ -12,8 +13,8 @@ export class SyncScheduler implements OnModuleInit {
   ) {}
 
   onModuleInit() {
-    const intervalMs = this.config.get<number>('DROPBOX_SYNC_INTERVAL_MS') ?? 60000;
-    setInterval(() => void this.runOnce(), intervalMs);
+    const intervalSeconds = this.config.get<number>('DROPBOX_SYNC_INTERVAL_SECONDS') ?? this.defaultIntervalSeconds;
+    setInterval(() => void this.runOnce(), intervalSeconds * 1000);
   }
 
   private async runOnce() {

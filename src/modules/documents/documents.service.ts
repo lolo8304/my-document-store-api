@@ -197,45 +197,29 @@ export class DocumentsService {
         phase: 'checking',
       });
 
-      for (const sourceFile of sourceFiles) {
+      const existingSyncIdentities = await this.findExistingSyncIdentities(sourceFiles);
+      const filesToImport = sourceFiles.filter((sourceFile) => !existingSyncIdentities.has(this.syncIdentityKey(sourceFile.name, this.syncDate(sourceFile))));
+      skipped = sourceFiles.length - filesToImport.length;
+      current = skipped;
+      this.logger.log(`Dropbox sync skipped ${skipped} unchanged file(s); ${filesToImport.length} file(s) need import or retry`);
+
+      await this.updateSyncProgress({
+        running: true,
+        current,
+        total: sourceFiles.length,
+        imported,
+        skipped,
+        markedDeleted: 0,
+        failed,
+        status: 'running',
+        phase: 'checking',
+      });
+
+      for (const sourceFile of filesToImport) {
         if (await this.isSyncStopRequested()) {
           this.logger.log('Dropbox sync stop requested; stopping before next file');
           this.emitStoppedProgress(current, sourceFiles.length, imported, skipped, failed);
           return { imported, skipped, markedDeleted: 0, failed };
-        }
-
-        const existing = await this.metadataModel.findOne({
-          fileName: sourceFile.name,
-          modifiedAtDropbox: this.syncDate(sourceFile),
-          $or: [
-            { status: 'pending' },
-            {
-              status: 'processed',
-              spellcheckCorrections: { $gte: 0 },
-            },
-          ],
-        });
-
-        if (existing) {
-          await this.ensureChunkPartialTerms(existing._id, existing.fileName);
-          skipped += 1;
-          current += 1;
-          if (await this.isSyncStopRequested()) {
-            this.logger.log('Dropbox sync stop requested; stopping after skipped file');
-            this.emitStoppedProgress(current, sourceFiles.length, imported, skipped, failed);
-            return { imported, skipped, markedDeleted: 0, failed };
-          }
-          await this.updateSyncProgress({
-            running: true,
-            current,
-            total: sourceFiles.length,
-            imported,
-            skipped,
-            markedDeleted: 0,
-            failed,
-            status: 'running',
-          });
-          continue;
         }
 
         try {
@@ -693,7 +677,7 @@ export class DocumentsService {
 
   private async markMissingSourceFilesDeleted(sourceFiles: DropboxPdfFile[]): Promise<number> {
     const activeKeys = new Set(sourceFiles.map((file) => this.syncIdentityKey(file.name, this.syncDate(file))));
-    const activeMetadata = await this.metadataModel.find({ status: { $ne: 'deleted' } }).lean();
+    const activeMetadata = await this.metadataModel.find({ status: { $ne: 'deleted' } }).select('_id fileName modifiedAtDropbox').lean();
     const missingIds = activeMetadata
       .filter((item) => !activeKeys.has(this.syncIdentityKey(item.fileName, item.modifiedAtDropbox)))
       .map((item) => item._id);
@@ -710,32 +694,36 @@ export class DocumentsService {
     return missingIds.length;
   }
 
-  private async ensureChunkPartialTerms(metadataId: Types.ObjectId, fileName: string): Promise<void> {
-    const chunks = await this.chunkModel
-      .find({
-        metadataId,
-        $or: [{ partialTerms: { $exists: false } }, { partialTerms: [] }],
-      })
-      .select('_id text')
-      .lean();
-
-    if (chunks.length === 0) {
-      return;
+  private async findExistingSyncIdentities(sourceFiles: DropboxPdfFile[]): Promise<Set<string>> {
+    if (sourceFiles.length === 0) {
+      return new Set();
     }
 
-    const fileNamePartialTerms = buildPartialTerms(fileName);
-    await this.chunkModel.bulkWrite(
-      chunks.map((chunk) => ({
-        updateOne: {
-          filter: { _id: chunk._id },
-          update: {
-            $set: {
-              partialTerms: Array.from(new Set([...buildPartialTerms(chunk.text), ...fileNamePartialTerms])),
-            },
+    const fileNames = Array.from(new Set(sourceFiles.map((file) => file.name)));
+    const syncDates = Array.from(
+      new Set(
+        sourceFiles
+          .map((file) => this.syncDate(file)?.toISOString())
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ).map((value) => new Date(value));
+
+    const existing = await this.metadataModel
+      .find({
+        fileName: { $in: fileNames },
+        modifiedAtDropbox: { $in: syncDates },
+        $or: [
+          { status: 'pending' },
+          {
+            status: 'processed',
+            spellcheckCorrections: { $gte: 0 },
           },
-        },
-      })),
-    );
+        ],
+      })
+      .select('fileName modifiedAtDropbox')
+      .lean();
+
+    return new Set(existing.map((item) => this.syncIdentityKey(item.fileName, item.modifiedAtDropbox)));
   }
 
   private syncDate(file: DropboxPdfFile): Date | undefined {
