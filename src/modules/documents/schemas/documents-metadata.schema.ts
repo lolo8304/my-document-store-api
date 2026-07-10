@@ -8,6 +8,9 @@ export class DocumentsMetadata {
   @Prop({ required: true, unique: true, index: true })
   fileName: string;
 
+  @Prop({ index: true })
+  title?: string;
+
   @Prop({ required: true, index: true })
   dropboxPath: string;
 

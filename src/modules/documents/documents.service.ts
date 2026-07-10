@@ -10,6 +10,7 @@ import { PdfTextService } from './pdf-text.service';
 import { SpellcheckService } from './spellcheck.service';
 import { SearchDocumentsDto } from './dto/search-documents.dto';
 import { SearchResultDto, SearchResultItem } from './dto/search-result.dto';
+import { UpdateDocumentDto } from './dto/update-document.dto';
 import { DocumentChunk } from './schemas/document-chunk.schema';
 import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
@@ -75,6 +76,7 @@ export class DocumentsService {
         const text = chunk?.text ?? '';
         return {
           documentId: String(document._id),
+          title: document.title ?? document.fileName,
           fileName: document.fileName,
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
@@ -100,7 +102,7 @@ export class DocumentsService {
   }
 
   async getFullText(id: string) {
-    await this.getDocument(id);
+    const document = await this.getDocument(id);
     const chunks = await this.chunkModel
       .find({ metadataId: new Types.ObjectId(id), deleted: false })
       .sort({ chunkIndex: 1 })
@@ -108,8 +110,52 @@ export class DocumentsService {
 
     return {
       documentId: id,
+      title: document.title ?? document.fileName,
+      fileName: document.fileName,
       text: mergeOverlappingChunks(chunks.map((chunk) => chunk.text)),
     };
+  }
+
+  async updateDocument(id: string, dto: UpdateDocumentDto) {
+    const nextTitle = dto.title.trim();
+    if (!nextTitle) {
+      throw new BadRequestException('Document title is required');
+    }
+
+    const document = await this.getDocument(id);
+    if ((document.title ?? document.fileName) === nextTitle) {
+      return { documentId: id, title: document.title ?? document.fileName, fileName: document.fileName };
+    }
+
+    const chunks = await this.chunkModel
+      .find({ metadataId: new Types.ObjectId(id), deleted: false })
+      .select('_id text fileName')
+      .lean();
+    const titleTerms = normalizeTerms(nextTitle);
+    const titlePartialTerms = buildPartialTerms(nextTitle);
+
+    await this.connection.transaction(async (session) => {
+      await this.metadataModel.updateOne({ _id: id }, { $set: { title: nextTitle } }, { session });
+
+      if (chunks.length > 0) {
+        await this.chunkModel.bulkWrite(
+          chunks.map((chunk) => ({
+            updateOne: {
+              filter: { _id: chunk._id },
+              update: {
+                $set: {
+                  terms: Array.from(new Set([...normalizeTerms(chunk.text), ...normalizeTerms(chunk.fileName), ...titleTerms])),
+                  partialTerms: Array.from(new Set([...buildPartialTerms(chunk.text), ...buildPartialTerms(chunk.fileName), ...titlePartialTerms])),
+                },
+              },
+            },
+          })),
+          { session },
+        );
+      }
+    });
+
+    return { documentId: id, title: nextTitle, fileName: document.fileName };
   }
 
   async getPdfLink(id: string) {
@@ -871,6 +917,7 @@ export class DocumentsService {
         );
         items.push({
           documentId: String(document._id),
+          title: document.title ?? document.fileName,
           fileName: document.fileName,
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),

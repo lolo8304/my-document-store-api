@@ -1,5 +1,6 @@
 export interface SearchResultItem {
   documentId: string;
+  title: string;
   fileName: string;
   language?: string;
   createdAt?: string;

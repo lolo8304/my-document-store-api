@@ -1,6 +1,7 @@
-import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Query, UseGuards } from '@nestjs/common';
 import { ApiKeyGuard } from '../../common/auth/api-key.guard';
 import { SearchDocumentsDto } from './dto/search-documents.dto';
+import { UpdateDocumentDto } from './dto/update-document.dto';
 import { DocumentsService } from './documents.service';
 
 @UseGuards(ApiKeyGuard)
@@ -21,6 +22,11 @@ export class DocumentsController {
   @Get(':id')
   getDocument(@Param('id') id: string) {
     return this.documents.getDocument(id);
+  }
+
+  @Patch(':id')
+  updateDocument(@Param('id') id: string, @Body() body: UpdateDocumentDto) {
+    return this.documents.updateDocument(id, body);
   }
 
   @Get(':id/text')
