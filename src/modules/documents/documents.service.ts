@@ -15,6 +15,7 @@ import { DocumentChunk } from './schemas/document-chunk.schema';
 import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
 import { SyncProgressEvent, SyncProgressGateway } from './sync-progress.gateway';
+import { detectSentDate, formatSentDate, parseSentDateInput } from './utils/sent-date.utils';
 import { buildExcerpt, buildMultiTermExcerpt, buildPartialTerms, chunkText, mergeOverlappingChunks, normalizeTerms } from './utils/text.utils';
 import { SettingsService } from '../settings/settings.service';
 
@@ -26,6 +27,7 @@ class SyncStoppedError extends Error {
 
 type SyncCounters = Pick<SyncProgressEvent, 'current' | 'total' | 'imported' | 'skipped' | 'markedDeleted' | 'failed'>;
 type TagMode = 'or' | 'and';
+type MetadataResult = DocumentsMetadata & { _id: Types.ObjectId };
 const trashTag = 'trash';
 const noTagsFilterTag = 'no-symbol';
 
@@ -79,11 +81,13 @@ export class DocumentsService {
 
     const tags = await this.parseTags(tagValue);
     const tagFilter = this.documentTagFilter(tags, tagMode);
-    const documents = await this.metadataModel
+    const documents = await this.ensureSentDateStatuses(
+      await this.metadataModel
       .find({ status: 'processed', ...tagFilter })
       .sort({ modifiedAtDropbox: -1, fileName: 1 })
       .limit(limit)
-      .lean();
+        .lean(),
+    );
     const chunks = await this.chunkModel
       .find({ metadataId: { $in: documents.map((document) => document._id) }, deleted: false, chunkIndex: 0 })
       .lean();
@@ -101,6 +105,8 @@ export class DocumentsService {
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
+          sentAt: formatSentDate(document.sentAt),
+          hasSentDate: document.hasSentDate ?? false,
           excerpt: text.length > 160 ? `${text.slice(0, 160)}...` : text,
           matchedTerms: [],
           textUrl: `/documents/${document._id}/text`,
@@ -138,7 +144,7 @@ export class DocumentsService {
   }
 
   async updateDocument(id: string, dto: UpdateDocumentDto) {
-    if (dto.title === undefined && dto.tags === undefined) {
+    if (dto.title === undefined && dto.tags === undefined && dto.sentAt === undefined) {
       throw new BadRequestException('No document updates provided');
     }
 
@@ -149,8 +155,15 @@ export class DocumentsService {
 
     const document = await this.getDocument(id);
     const nextTags = dto.tags === undefined ? document.tags ?? [] : await this.settings.normalizeDocumentTags(dto.tags);
+    const nextSentAt = dto.sentAt === undefined || dto.sentAt === null ? undefined : parseSentDateInput(dto.sentAt);
+    if (dto.sentAt !== undefined && dto.sentAt !== null && !nextSentAt) {
+      throw new BadRequestException('Sent date must use yyyy-MM-dd');
+    }
     const shouldUpdateTitle = nextTitle !== undefined && (document.title ?? document.fileName) !== nextTitle;
     const shouldUpdateTags = dto.tags !== undefined && !this.sameTags(document.tags ?? [], nextTags);
+    const shouldUpdateSentAt =
+      dto.sentAt !== undefined &&
+      (formatSentDate(document.sentAt) !== formatSentDate(nextSentAt) || document.hasSentDate !== Boolean(nextSentAt));
 
     const chunks = await this.chunkModel
       .find({ metadataId: new Types.ObjectId(id), deleted: false })
@@ -164,9 +177,21 @@ export class DocumentsService {
       const metadataSet = {
         ...(shouldUpdateTitle ? { title: nextTitle } : {}),
         ...(shouldUpdateTags ? { tags: nextTags } : {}),
+        ...(shouldUpdateSentAt ? { hasSentDate: Boolean(nextSentAt) } : {}),
+        ...(shouldUpdateSentAt && nextSentAt ? { sentAt: nextSentAt } : {}),
       };
-      if (Object.keys(metadataSet).length > 0) {
-        await this.metadataModel.updateOne({ _id: id }, { $set: metadataSet }, { session });
+      const metadataUnset = {
+        ...(shouldUpdateSentAt && !nextSentAt ? { sentAt: '' } : {}),
+      };
+      if (Object.keys(metadataSet).length > 0 || Object.keys(metadataUnset).length > 0) {
+        await this.metadataModel.updateOne(
+          { _id: id },
+          {
+            ...(Object.keys(metadataSet).length > 0 ? { $set: metadataSet } : {}),
+            ...(Object.keys(metadataUnset).length > 0 ? { $unset: metadataUnset } : {}),
+          },
+          { session },
+        );
       }
 
       if (chunks.length > 0 && (shouldUpdateTitle || shouldUpdateTags)) {
@@ -188,7 +213,16 @@ export class DocumentsService {
       }
     });
 
-    return { documentId: id, title: effectiveTitle, fileName: document.fileName, tags: nextTags };
+    const effectiveSentAt = dto.sentAt === undefined ? document.sentAt : nextSentAt;
+    const effectiveHasSentDate = dto.sentAt === undefined ? document.hasSentDate ?? Boolean(document.sentAt) : Boolean(effectiveSentAt);
+    return {
+      documentId: id,
+      title: effectiveTitle,
+      fileName: document.fileName,
+      tags: nextTags,
+      sentAt: formatSentDate(effectiveSentAt),
+      hasSentDate: effectiveHasSentDate,
+    };
   }
 
   async getPdfLink(id: string) {
@@ -670,6 +704,7 @@ export class DocumentsService {
       await this.throwIfSyncStopRequested();
 
       const analyzedText = spellchecked.text;
+      const sentAt = detectSentDate(analyzedText, language);
       const chunks = chunkText(analyzedText);
       const vectorSearchEnabled = this.isVectorSearchEnabled();
       if (vectorSearchEnabled) {
@@ -710,9 +745,11 @@ export class DocumentsService {
             ocrRotationAngle: extracted.rotationAngle,
             processedAt: new Date(),
             modifiedAtDropbox: this.syncDate(sourceFile),
+            hasSentDate: Boolean(sentAt),
+            ...(sentAt ? { sentAt } : {}),
             pdfUrl,
           },
-          $unset: { error: '' },
+          $unset: { error: '', ...(sentAt ? {} : { sentAt: '' }) },
         },
       );
     } catch (error) {
@@ -868,11 +905,12 @@ export class DocumentsService {
   }
 
   private async hydrateMetadataResults(
-    documents: (DocumentsMetadata & { _id: Types.ObjectId })[],
+    documents: MetadataResult[],
     page: number,
     pageSize: number,
     total: number,
   ): Promise<SearchResultDto> {
+    documents = await this.ensureSentDateStatuses(documents);
     const chunks = await this.chunkModel.find({ metadataId: { $in: documents.map((document) => document._id) }, deleted: false, chunkIndex: 0 }).lean();
     const chunkByMetadataId = new Map(chunks.map((chunk) => [String(chunk.metadataId), chunk]));
 
@@ -888,6 +926,8 @@ export class DocumentsService {
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
+          sentAt: formatSentDate(document.sentAt),
+          hasSentDate: document.hasSentDate ?? false,
           excerpt: text.length > 160 ? `${text.slice(0, 160)}...` : text,
           matchedTerms: [],
           textUrl: `/documents/${document._id}/text`,
@@ -1039,7 +1079,7 @@ export class DocumentsService {
 
   private async hydrateChunkResults(results: any[], terms: string[]): Promise<SearchResultItem[]> {
     const metadataIds = results.map((result) => result._id);
-    const metadata = await this.metadataModel.find({ _id: { $in: metadataIds } }).lean();
+    const metadata = await this.ensureSentDateStatuses(await this.metadataModel.find({ _id: { $in: metadataIds } }).lean());
     const metadataById = new Map(metadata.map((item) => [String(item._id), item]));
 
     return results.reduce<SearchResultItem[]>((items, result) => {
@@ -1060,6 +1100,8 @@ export class DocumentsService {
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
+          sentAt: formatSentDate(document.sentAt),
+          hasSentDate: document.hasSentDate ?? false,
           excerpt: result.bestMatchCount ? buildMultiTermExcerpt(chunks.map((item: DocumentChunk) => item.text), terms) : buildExcerpt(chunk.text, terms),
           matchedTerms: matchedTerms.length > 0 ? matchedTerms : terms.filter((term) => chunk.terms?.includes(term)),
           textUrl: `/documents/${document._id}/text`,
@@ -1068,5 +1110,49 @@ export class DocumentsService {
         });
         return items;
       }, []);
+  }
+
+  private async ensureSentDateStatuses(documents: MetadataResult[]): Promise<MetadataResult[]> {
+    const missingStatusDocuments = documents.filter((document) => document.hasSentDate === undefined);
+    if (missingStatusDocuments.length === 0) {
+      return documents;
+    }
+
+    const existingSentDateUpdates = missingStatusDocuments.filter((document) => document.sentAt);
+    for (const document of existingSentDateUpdates) {
+      document.hasSentDate = true;
+    }
+
+    const documentsToDetect = missingStatusDocuments.filter((document) => !document.sentAt);
+    const chunks = await this.chunkModel
+      .find({ metadataId: { $in: documentsToDetect.map((document) => document._id) }, deleted: false })
+      .sort({ metadataId: 1, chunkIndex: 1 })
+      .select('metadataId text')
+      .lean();
+    const textByMetadataId = chunks.reduce<Map<string, string[]>>((acc, chunk) => {
+      const key = String(chunk.metadataId);
+      acc.set(key, [...(acc.get(key) ?? []), chunk.text]);
+      return acc;
+    }, new Map<string, string[]>());
+
+    for (const document of documentsToDetect) {
+      const text = mergeOverlappingChunks(textByMetadataId.get(String(document._id)) ?? []);
+      const sentAt = text ? detectSentDate(text, document.language ?? '') : undefined;
+      document.sentAt = sentAt;
+      document.hasSentDate = Boolean(sentAt);
+    }
+
+    await this.metadataModel.bulkWrite(
+      missingStatusDocuments.map((document) => ({
+        updateOne: {
+          filter: { _id: document._id },
+          update: document.sentAt
+            ? { $set: { hasSentDate: true, sentAt: document.sentAt } }
+            : { $set: { hasSentDate: false }, $unset: { sentAt: '' } },
+        },
+      })),
+    );
+
+    return documents;
   }
 }

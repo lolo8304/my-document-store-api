@@ -6,6 +6,8 @@ export interface SearchResultItem {
   language?: string;
   createdAt?: string;
   modifiedAt?: string;
+  sentAt?: string;
+  hasSentDate: boolean;
   excerpt: string;
   matchedTerms: string[];
   textUrl: string;

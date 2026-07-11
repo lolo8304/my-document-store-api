@@ -50,6 +50,12 @@ export class DocumentsMetadata {
   @Prop()
   modifiedAtDropbox?: Date;
 
+  @Prop({ index: true })
+  sentAt?: Date;
+
+  @Prop({ index: true })
+  hasSentDate?: boolean;
+
   @Prop()
   processedAt?: Date;
 
