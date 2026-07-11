@@ -11,6 +11,9 @@ export class DocumentsMetadata {
   @Prop({ index: true })
   title?: string;
 
+  @Prop({ type: [String], default: [], index: true })
+  tags: string[];
+
   @Prop({ required: true, index: true })
   dropboxPath: string;
 

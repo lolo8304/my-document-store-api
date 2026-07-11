@@ -26,6 +26,9 @@ export class DocumentChunk {
   @Prop({ type: [String], index: true })
   partialTerms: string[];
 
+  @Prop({ type: [String], default: [], index: true })
+  tags: string[];
+
   @Prop({ default: false, index: true })
   deleted: boolean;
 }

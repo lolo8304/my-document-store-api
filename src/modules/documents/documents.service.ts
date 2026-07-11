@@ -16,6 +16,7 @@ import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
 import { SyncProgressEvent, SyncProgressGateway } from './sync-progress.gateway';
 import { buildExcerpt, buildMultiTermExcerpt, buildPartialTerms, chunkText, mergeOverlappingChunks, normalizeTerms } from './utils/text.utils';
+import { SettingsService } from '../settings/settings.service';
 
 class SyncStoppedError extends Error {
   constructor() {
@@ -24,6 +25,9 @@ class SyncStoppedError extends Error {
 }
 
 type SyncCounters = Pick<SyncProgressEvent, 'current' | 'total' | 'imported' | 'skipped' | 'markedDeleted' | 'failed'>;
+type TagMode = 'or' | 'and';
+const trashTag = 'trash';
+const noTagsFilterTag = 'no-symbol';
 
 @Injectable()
 export class DocumentsService {
@@ -45,23 +49,38 @@ export class DocumentsService {
     private readonly spellcheck: SpellcheckService,
     private readonly syncProgress: SyncProgressGateway,
     private readonly config: ConfigService,
+    private readonly settings: SettingsService,
   ) {}
 
   async search(dto: SearchDocumentsDto): Promise<SearchResultDto> {
+    if (this.isAllQuery(dto.q)) {
+      return dto.tags.length > 0 ? this.searchByTags(dto) : this.searchAll(dto);
+    }
+
+    const hasQuery = normalizeTerms(dto.q).length > 0;
+    if (!hasQuery) {
+      if (dto.tags.length > 0) {
+        return this.searchByTags(dto);
+      }
+      throw new BadRequestException('Search query or tags required');
+    }
+
     if (dto.type === 'question' && !this.isVectorSearchEnabled()) {
       throw new BadRequestException('Vector search is disabled');
     }
     return dto.type === 'question' ? this.searchByQuestion(dto) : this.searchByQuery(dto);
   }
 
-  async latest(limitValue?: string): Promise<SearchResultDto> {
+  async latest(limitValue?: string, tagValue?: string, tagMode: TagMode = 'or'): Promise<SearchResultDto> {
     const limit = Number(limitValue ?? '1');
     if (![1, 2, 10].includes(limit)) {
       throw new BadRequestException('Latest documents limit must be 1, 2, or 10');
     }
 
+    const tags = await this.parseTags(tagValue);
+    const tagFilter = this.documentTagFilter(tags, tagMode);
     const documents = await this.metadataModel
-      .find({ status: 'processed' })
+      .find({ status: 'processed', ...tagFilter })
       .sort({ modifiedAtDropbox: -1, fileName: 1 })
       .limit(limit)
       .lean();
@@ -78,6 +97,7 @@ export class DocumentsService {
           documentId: String(document._id),
           title: document.title ?? document.fileName,
           fileName: document.fileName,
+          tags: document.tags ?? [],
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
@@ -112,32 +132,44 @@ export class DocumentsService {
       documentId: id,
       title: document.title ?? document.fileName,
       fileName: document.fileName,
+      tags: document.tags ?? [],
       text: mergeOverlappingChunks(chunks.map((chunk) => chunk.text)),
     };
   }
 
   async updateDocument(id: string, dto: UpdateDocumentDto) {
-    const nextTitle = dto.title.trim();
-    if (!nextTitle) {
+    if (dto.title === undefined && dto.tags === undefined) {
+      throw new BadRequestException('No document updates provided');
+    }
+
+    const nextTitle = dto.title?.trim();
+    if (dto.title !== undefined && !nextTitle) {
       throw new BadRequestException('Document title is required');
     }
 
     const document = await this.getDocument(id);
-    if ((document.title ?? document.fileName) === nextTitle) {
-      return { documentId: id, title: document.title ?? document.fileName, fileName: document.fileName };
-    }
+    const nextTags = dto.tags === undefined ? document.tags ?? [] : await this.settings.normalizeDocumentTags(dto.tags);
+    const shouldUpdateTitle = nextTitle !== undefined && (document.title ?? document.fileName) !== nextTitle;
+    const shouldUpdateTags = dto.tags !== undefined && !this.sameTags(document.tags ?? [], nextTags);
 
     const chunks = await this.chunkModel
       .find({ metadataId: new Types.ObjectId(id), deleted: false })
       .select('_id text fileName')
       .lean();
-    const titleTerms = normalizeTerms(nextTitle);
-    const titlePartialTerms = buildPartialTerms(nextTitle);
+    const effectiveTitle = nextTitle ?? document.title ?? document.fileName;
+    const titleTerms = normalizeTerms(effectiveTitle);
+    const titlePartialTerms = buildPartialTerms(effectiveTitle);
 
     await this.connection.transaction(async (session) => {
-      await this.metadataModel.updateOne({ _id: id }, { $set: { title: nextTitle } }, { session });
+      const metadataSet = {
+        ...(shouldUpdateTitle ? { title: nextTitle } : {}),
+        ...(shouldUpdateTags ? { tags: nextTags } : {}),
+      };
+      if (Object.keys(metadataSet).length > 0) {
+        await this.metadataModel.updateOne({ _id: id }, { $set: metadataSet }, { session });
+      }
 
-      if (chunks.length > 0) {
+      if (chunks.length > 0 && (shouldUpdateTitle || shouldUpdateTags)) {
         await this.chunkModel.bulkWrite(
           chunks.map((chunk) => ({
             updateOne: {
@@ -146,6 +178,7 @@ export class DocumentsService {
                 $set: {
                   terms: Array.from(new Set([...normalizeTerms(chunk.text), ...normalizeTerms(chunk.fileName), ...titleTerms])),
                   partialTerms: Array.from(new Set([...buildPartialTerms(chunk.text), ...buildPartialTerms(chunk.fileName), ...titlePartialTerms])),
+                  tags: nextTags,
                 },
               },
             },
@@ -155,7 +188,7 @@ export class DocumentsService {
       }
     });
 
-    return { documentId: id, title: nextTitle, fileName: document.fileName };
+    return { documentId: id, title: effectiveTitle, fileName: document.fileName, tags: nextTags };
   }
 
   async getPdfLink(id: string) {
@@ -649,6 +682,7 @@ export class DocumentsService {
       await this.emitImportPhase('storing', sourceFile.name, counters, fileStartedAt);
       const fileNameTerms = normalizeTerms(sourceFile.name);
       const fileNamePartialTerms = buildPartialTerms(sourceFile.name);
+      const tags = metadata.tags ?? [];
       await this.chunkModel.deleteMany({ metadataId: metadata._id });
       await this.chunkModel.insertMany(
         chunks.map((text, index) => ({
@@ -658,6 +692,7 @@ export class DocumentsService {
           text,
           terms: Array.from(new Set([...normalizeTerms(text), ...fileNameTerms])),
           partialTerms: Array.from(new Set([...buildPartialTerms(text), ...fileNamePartialTerms])),
+          tags,
           ...(vectorSearchEnabled ? { embedding: vectors[index] } : {}),
           deleted: false,
         })),
@@ -780,13 +815,99 @@ export class DocumentsService {
     return `${fileName}:${modifiedAt?.toISOString() ?? 'unknown'}`;
   }
 
+  private async parseTags(value?: string): Promise<string[]> {
+    return this.settings.normalizeDocumentTags(value?.split(',').map((tag) => tag.trim()).filter(Boolean), { includeSpecialFilters: true });
+  }
+
+  private sameTags(current: string[], next: string[]): boolean {
+    if (current.length !== next.length) {
+      return false;
+    }
+    const currentSet = new Set(current);
+    return next.every((tag) => currentSet.has(tag));
+  }
+
+  private isAllQuery(value: string): boolean {
+    return value.trim().toLowerCase() === 'all';
+  }
+
+  private async searchAll(dto: SearchDocumentsDto): Promise<SearchResultDto> {
+    const skip = (dto.page - 1) * dto.pageSize;
+    const filter = {
+      ...(dto.includeDeleted ? {} : { status: 'processed' }),
+      ...this.documentTagFilter(dto.tags, dto.tagMode),
+    };
+    const [documents, total] = await Promise.all([
+      this.metadataModel
+        .find(filter)
+        .sort({ modifiedAtDropbox: -1, fileName: 1 })
+        .skip(skip)
+        .limit(dto.pageSize)
+        .lean(),
+      this.metadataModel.countDocuments(filter),
+    ]);
+    return this.hydrateMetadataResults(documents, dto.page, dto.pageSize, total);
+  }
+
+  private async searchByTags(dto: SearchDocumentsDto): Promise<SearchResultDto> {
+    const skip = (dto.page - 1) * dto.pageSize;
+    const filter = {
+      ...(dto.includeDeleted ? {} : { status: 'processed' }),
+      ...this.documentTagFilter(dto.tags, dto.tagMode),
+    };
+    const [documents, total] = await Promise.all([
+      this.metadataModel
+        .find(filter)
+        .sort({ modifiedAtDropbox: -1, fileName: 1 })
+        .skip(skip)
+        .limit(dto.pageSize)
+        .lean(),
+      this.metadataModel.countDocuments(filter),
+    ]);
+    return this.hydrateMetadataResults(documents, dto.page, dto.pageSize, total);
+  }
+
+  private async hydrateMetadataResults(
+    documents: (DocumentsMetadata & { _id: Types.ObjectId })[],
+    page: number,
+    pageSize: number,
+    total: number,
+  ): Promise<SearchResultDto> {
+    const chunks = await this.chunkModel.find({ metadataId: { $in: documents.map((document) => document._id) }, deleted: false, chunkIndex: 0 }).lean();
+    const chunkByMetadataId = new Map(chunks.map((chunk) => [String(chunk.metadataId), chunk]));
+
+    return {
+      items: documents.map((document) => {
+        const chunk = chunkByMetadataId.get(String(document._id));
+        const text = chunk?.text ?? '';
+        return {
+          documentId: String(document._id),
+          title: document.title ?? document.fileName,
+          fileName: document.fileName,
+          tags: document.tags ?? [],
+          language: document.language,
+          createdAt: document.createdAtDropbox?.toISOString(),
+          modifiedAt: document.modifiedAtDropbox?.toISOString(),
+          excerpt: text.length > 160 ? `${text.slice(0, 160)}...` : text,
+          matchedTerms: [],
+          textUrl: `/documents/${document._id}/text`,
+          pdfUrl: document.pdfUrl,
+        };
+      }),
+      page,
+      pageSize,
+      total,
+    };
+  }
+
   private async searchByQuery(dto: SearchDocumentsDto): Promise<SearchResultDto> {
     const terms = normalizeTerms(dto.q);
     const skip = (dto.page - 1) * dto.pageSize;
     const deletedFilter = dto.includeDeleted ? {} : { deleted: false };
+    const tagFilter = this.documentTagFilter(dto.tags, dto.tagMode);
 
     const pipeline: PipelineStage[] = [
-      { $match: { ...deletedFilter, partialTerms: { $in: terms } } },
+      { $match: { ...deletedFilter, ...tagFilter, partialTerms: { $in: terms } } },
       {
         $addFields: {
           matchedTerms: {
@@ -862,6 +983,7 @@ export class DocumentsService {
     if (!dto.includeDeleted) {
       vectorSearch.filter = { deleted: false };
     }
+    vectorSearch.filter = { ...(vectorSearch.filter as Record<string, unknown> | undefined), ...this.documentTagFilter(dto.tags, dto.tagMode) };
 
     const pipeline: PipelineStage[] = [
       {
@@ -900,6 +1022,21 @@ export class DocumentsService {
     return this.config.get<string>('VECTOR_SEARCH_ENABLED') === 'true';
   }
 
+  private documentTagFilter(tags: string[], tagMode: TagMode): Record<string, unknown> {
+    if (tags.includes(noTagsFilterTag)) {
+      return { $or: [{ tags: { $exists: false } }, { tags: { $size: 0 } }] };
+    }
+    const hasTrashFilter = tags.includes(trashTag);
+    const visibleTags = tags.filter((tag) => tag !== trashTag && tag !== noTagsFilterTag);
+    if (hasTrashFilter) {
+      return visibleTags.length > 0 ? { tags: { $all: [trashTag, ...visibleTags] } } : { tags: trashTag };
+    }
+    if (visibleTags.length === 0) {
+      return { tags: { $ne: trashTag } };
+    }
+    return { tags: { ...(tagMode === 'and' ? { $all: visibleTags } : { $in: visibleTags }), $ne: trashTag } };
+  }
+
   private async hydrateChunkResults(results: any[], terms: string[]): Promise<SearchResultItem[]> {
     const metadataIds = results.map((result) => result._id);
     const metadata = await this.metadataModel.find({ _id: { $in: metadataIds } }).lean();
@@ -919,6 +1056,7 @@ export class DocumentsService {
           documentId: String(document._id),
           title: document.title ?? document.fileName,
           fileName: document.fileName,
+          tags: document.tags ?? [],
           language: document.language,
           createdAt: document.createdAtDropbox?.toISOString(),
           modifiedAt: document.modifiedAtDropbox?.toISOString(),

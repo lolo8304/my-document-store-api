@@ -10,9 +10,11 @@ import { EmbeddingService } from './embedding.service';
 import { PdfTextService } from './pdf-text.service';
 import { SpellcheckService } from './spellcheck.service';
 import { SyncProgressGateway } from './sync-progress.gateway';
+import { SettingsModule } from '../settings/settings.module';
 
 @Module({
   imports: [
+    SettingsModule,
     MongooseModule.forFeature([
       { name: DocumentsMetadata.name, schema: DocumentsMetadataSchema },
       { name: DocumentChunk.name, schema: DocumentChunkSchema },

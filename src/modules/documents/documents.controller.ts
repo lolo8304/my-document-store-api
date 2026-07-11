@@ -15,8 +15,8 @@ export class DocumentsController {
   }
 
   @Get('latest')
-  latest(@Query('limit') limit?: string) {
-    return this.documents.latest(limit);
+  latest(@Query('limit') limit?: string, @Query('tags') tags?: string, @Query('tagMode') tagMode?: 'or' | 'and') {
+    return this.documents.latest(limit, tags, tagMode);
   }
 
   @Get(':id')

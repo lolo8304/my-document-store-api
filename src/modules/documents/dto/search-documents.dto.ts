@@ -1,10 +1,10 @@
 import { Transform, Type } from 'class-transformer';
-import { IsIn, IsInt, IsNotEmpty, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsArray, IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 
 export class SearchDocumentsDto {
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  q: string;
+  q = '';
 
   @IsIn(['query', 'question'])
   type: 'query' | 'question' = 'query';
@@ -25,4 +25,21 @@ export class SearchDocumentsDto {
   @IsOptional()
   @Transform(({ value }) => value === 'true' || value === true)
   includeDeleted = false;
+
+  @IsOptional()
+  @Transform(({ value }) => {
+    if (Array.isArray(value)) {
+      return value;
+    }
+    if (typeof value === 'string') {
+      return value.split(',').map((tag) => tag.trim()).filter(Boolean);
+    }
+    return [];
+  })
+  @IsArray()
+  tags: string[] = [];
+
+  @IsOptional()
+  @IsIn(['or', 'and'])
+  tagMode: 'or' | 'and' = 'or';
 }

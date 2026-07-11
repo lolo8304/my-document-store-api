@@ -2,6 +2,7 @@ export interface SearchResultItem {
   documentId: string;
   title: string;
   fileName: string;
+  tags: string[];
   language?: string;
   createdAt?: string;
   modifiedAt?: string;
