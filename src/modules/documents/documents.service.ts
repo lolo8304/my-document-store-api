@@ -27,6 +27,8 @@ class SyncStoppedError extends Error {
 
 type SyncCounters = Pick<SyncProgressEvent, 'current' | 'total' | 'imported' | 'skipped' | 'markedDeleted' | 'failed'>;
 type TagMode = 'or' | 'and';
+type DocumentSortBy = 'sent' | 'scanned';
+type MongoSort = Record<string, 1 | -1>;
 type MetadataResult = DocumentsMetadata & { _id: Types.ObjectId };
 const trashTag = 'trash';
 const noTagsFilterTag = 'no-symbol';
@@ -73,7 +75,7 @@ export class DocumentsService {
     return dto.type === 'question' ? this.searchByQuestion(dto) : this.searchByQuery(dto);
   }
 
-  async latest(limitValue?: string, tagValue?: string, tagMode: TagMode = 'or'): Promise<SearchResultDto> {
+  async latest(limitValue?: string, tagValue?: string, tagMode: TagMode = 'or', sortBy: DocumentSortBy = 'scanned', missingSent = false): Promise<SearchResultDto> {
     const limit = Number(limitValue ?? '1');
     if (![1, 2, 10].includes(limit)) {
       throw new BadRequestException('Latest documents limit must be 1, 2, or 10');
@@ -81,11 +83,12 @@ export class DocumentsService {
 
     const tags = await this.parseTags(tagValue);
     const tagFilter = this.documentTagFilter(tags, tagMode);
+    const filter = { status: 'processed', ...tagFilter, ...this.missingSentFilter(missingSent) };
     const documents = await this.ensureSentDateStatuses(
       await this.metadataModel
-      .find({ status: 'processed', ...tagFilter })
-      .sort({ modifiedAtDropbox: -1, fileName: 1 })
-      .limit(limit)
+        .find(filter)
+        .sort(this.metadataSort(sortBy))
+        .limit(limit)
         .lean(),
     );
     const chunks = await this.chunkModel
@@ -873,11 +876,12 @@ export class DocumentsService {
     const filter = {
       ...(dto.includeDeleted ? {} : { status: 'processed' }),
       ...this.documentTagFilter(dto.tags, dto.tagMode),
+      ...this.missingSentFilter(dto.missingSent),
     };
     const [documents, total] = await Promise.all([
       this.metadataModel
         .find(filter)
-        .sort({ modifiedAtDropbox: -1, fileName: 1 })
+        .sort(this.metadataSort(dto.sortBy))
         .skip(skip)
         .limit(dto.pageSize)
         .lean(),
@@ -891,11 +895,12 @@ export class DocumentsService {
     const filter = {
       ...(dto.includeDeleted ? {} : { status: 'processed' }),
       ...this.documentTagFilter(dto.tags, dto.tagMode),
+      ...this.missingSentFilter(dto.missingSent),
     };
     const [documents, total] = await Promise.all([
       this.metadataModel
         .find(filter)
-        .sort({ modifiedAtDropbox: -1, fileName: 1 })
+        .sort(this.metadataSort(dto.sortBy))
         .skip(skip)
         .limit(dto.pageSize)
         .lean(),
@@ -979,12 +984,9 @@ export class DocumentsService {
         },
       },
       { $unwind: '$metadata' },
+      ...(dto.missingSent ? [{ $match: this.metadataMissingSentAggregationFilter() }] : []),
       {
-        $sort: {
-          bestMatchCount: -1 as const,
-          'metadata.modifiedAtDropbox': -1 as const,
-          'metadata.fileName': 1 as const,
-        },
+        $sort: this.chunkSearchSort(dto.sortBy),
       },
       {
         $facet: {
@@ -1038,7 +1040,17 @@ export class DocumentsService {
           score: { $max: '$score' },
         },
       },
-      { $sort: { score: -1 as const } },
+      {
+        $lookup: {
+          from: 'documents-metadata',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'metadata',
+        },
+      },
+      { $unwind: '$metadata' },
+      ...(dto.missingSent ? [{ $match: this.metadataMissingSentAggregationFilter() }] : []),
+      { $sort: dto.sortBy ? this.vectorSearchSort(dto.sortBy) : { score: -1 as const } },
       {
         $facet: {
           items: [{ $skip: skip }, { $limit: dto.pageSize }],
@@ -1055,6 +1067,85 @@ export class DocumentsService {
       page: dto.page,
       pageSize: dto.pageSize,
       total: result?.total?.[0]?.count ?? 0,
+    };
+  }
+
+  private metadataSort(sortBy: DocumentSortBy = 'scanned'): MongoSort {
+    if (sortBy === 'sent') {
+      return { hasSentDate: -1 as const, sentAt: -1 as const, modifiedAtDropbox: -1 as const, fileName: 1 as const };
+    }
+    return { modifiedAtDropbox: -1 as const, fileName: 1 as const };
+  }
+
+  private chunkSearchSort(sortBy?: DocumentSortBy): MongoSort {
+    if (sortBy === 'sent') {
+      return {
+        'metadata.hasSentDate': -1 as const,
+        'metadata.sentAt': -1 as const,
+        bestMatchCount: -1 as const,
+        'metadata.modifiedAtDropbox': -1 as const,
+        'metadata.fileName': 1 as const,
+      };
+    }
+    if (sortBy === 'scanned') {
+      return {
+        'metadata.modifiedAtDropbox': -1 as const,
+        bestMatchCount: -1 as const,
+        'metadata.fileName': 1 as const,
+      };
+    }
+    return {
+      bestMatchCount: -1 as const,
+      'metadata.modifiedAtDropbox': -1 as const,
+      'metadata.fileName': 1 as const,
+    };
+  }
+
+  private vectorSearchSort(sortBy: DocumentSortBy): MongoSort {
+    if (sortBy === 'sent') {
+      return {
+        'metadata.hasSentDate': -1 as const,
+        'metadata.sentAt': -1 as const,
+        score: -1 as const,
+        'metadata.modifiedAtDropbox': -1 as const,
+        'metadata.fileName': 1 as const,
+      };
+    }
+    return {
+      'metadata.modifiedAtDropbox': -1 as const,
+      score: -1 as const,
+      'metadata.fileName': 1 as const,
+    };
+  }
+
+  private missingSentFilter(missingSent: boolean): Record<string, unknown> {
+    if (!missingSent) {
+      return {};
+    }
+    return {
+      $or: [
+        { hasSentDate: false },
+        {
+          $and: [
+            { hasSentDate: { $exists: false } },
+            { sentAt: { $exists: false } },
+          ],
+        },
+      ],
+    };
+  }
+
+  private metadataMissingSentAggregationFilter(): Record<string, unknown> {
+    return {
+      $or: [
+        { 'metadata.hasSentDate': false },
+        {
+          $and: [
+            { 'metadata.hasSentDate': { $exists: false } },
+            { 'metadata.sentAt': { $exists: false } },
+          ],
+        },
+      ],
     };
   }
 

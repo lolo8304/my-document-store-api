@@ -47,14 +47,17 @@ const numericDatePattern = /\b([0-3]?\d)\.([01]?\d)\.(\d{4})\b/g;
 const namedDatePattern = /\b([0-3]?\d)\.\s*([A-Za-zÀ-ÖØ-öø-ÿ]{3,})\.?\s+(\d{4})\b/g;
 
 export function detectSentDate(text: string, language: string): Date | undefined {
-  const relevantText = firstQuarter(text);
-  const numericMatch = firstValidNumericDate(relevantText);
+  return detectSentDateInText(firstQuarter(text), language) ?? detectSentDateInText(lastTenth(text), language);
+}
+
+function detectSentDateInText(text: string, language: string): Date | undefined {
+  const numericMatch = firstValidNumericDate(text);
   if (numericMatch) {
     return numericMatch;
   }
 
   const monthIndexes = monthIndexesByLanguage[language] ?? combinedMonthIndexes();
-  for (const match of relevantText.matchAll(namedDatePattern)) {
+  for (const match of text.matchAll(namedDatePattern)) {
     const day = Number(match[1]);
     const month = monthIndexes[normalizeMonthName(match[2])];
     const year = Number(match[3]);
@@ -69,6 +72,10 @@ export function detectSentDate(text: string, language: string): Date | undefined
 
 function firstQuarter(text: string) {
   return text.slice(0, Math.ceil(text.length * 0.25));
+}
+
+function lastTenth(text: string) {
+  return text.slice(Math.floor(text.length * 0.9));
 }
 
 export function parseSentDateInput(value: string): Date | undefined {

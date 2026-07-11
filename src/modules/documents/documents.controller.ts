@@ -15,8 +15,14 @@ export class DocumentsController {
   }
 
   @Get('latest')
-  latest(@Query('limit') limit?: string, @Query('tags') tags?: string, @Query('tagMode') tagMode?: 'or' | 'and') {
-    return this.documents.latest(limit, tags, tagMode);
+  latest(
+    @Query('limit') limit?: string,
+    @Query('tags') tags?: string,
+    @Query('tagMode') tagMode?: 'or' | 'and',
+    @Query('sortBy') sortBy?: 'sent' | 'scanned',
+    @Query('missingSent') missingSent?: string,
+  ) {
+    return this.documents.latest(limit, tags, tagMode, sortBy, missingSent === 'true');
   }
 
   @Get(':id')

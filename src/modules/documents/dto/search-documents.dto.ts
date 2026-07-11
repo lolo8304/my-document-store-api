@@ -42,4 +42,12 @@ export class SearchDocumentsDto {
   @IsOptional()
   @IsIn(['or', 'and'])
   tagMode: 'or' | 'and' = 'or';
+
+  @IsOptional()
+  @IsIn(['sent', 'scanned'])
+  sortBy?: 'sent' | 'scanned';
+
+  @IsOptional()
+  @Transform(({ value }) => value === 'true' || value === true)
+  missingSent = false;
 }
