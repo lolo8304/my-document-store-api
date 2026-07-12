@@ -42,6 +42,22 @@ export class SpellcheckService {
     return { text: correctedText, corrections };
   }
 
+  dictionaryScore(text: string, language: string): number {
+    const words = Array.from(text.matchAll(/\p{L}[\p{L}'-]{2,}/gu), (match) => match[0]).slice(0, 120);
+    if (words.length === 0) {
+      return 0;
+    }
+
+    const languages: SupportedLanguage[] = language === 'deu' || language === 'eng' || language === 'fra' ? [language] : ['deu', 'eng', 'fra'];
+    return Math.max(
+      ...languages.map((candidate) => {
+        const checker = this.checkers[candidate];
+        const knownWords = words.filter((word) => this.shouldSkipWord(word) || checker.correct(word)).length;
+        return knownWords / words.length;
+      }),
+    );
+  }
+
   private loadDictionary(packageName: string): SpellChecker {
     const requireForResolve = createRequire(__filename);
     const dictionaryRoot = dirname(requireForResolve.resolve(packageName));

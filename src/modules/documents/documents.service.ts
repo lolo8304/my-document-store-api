@@ -698,12 +698,13 @@ export class DocumentsService {
 
       await this.emitImportPhase('extracting', sourceFile.name, counters, fileStartedAt);
       const extracted = await this.pdfText.extractText(pdf);
+      const extractedText = extracted.source === 'ocr' ? this.cleanOcrNoise(extracted.text, sourceFile.name) : extracted.text;
       await this.throwIfSyncStopRequested();
 
-      const language = franc(extracted.text, { only: ['deu', 'eng', 'fra'] });
+      const language = franc(extractedText, { only: ['deu', 'eng', 'fra'] });
       await this.emitImportPhase('spellchecking', sourceFile.name, counters, fileStartedAt);
       await this.throwIfSyncStopRequested();
-      const spellchecked = this.applySpellcheck(extracted.text, language);
+      const spellchecked = this.applySpellcheck(extractedText, language);
       await this.throwIfSyncStopRequested();
 
       const analyzedText = spellchecked.text;
@@ -794,6 +795,161 @@ export class DocumentsService {
       return { text, corrections: 0 };
     }
     return this.spellcheck.correctText(text, language);
+  }
+
+  private cleanOcrNoise(text: string, fileName: string): string {
+    const normalized = this.normalizeOcrText(text);
+    const lines = normalized
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !this.isObviousOcrGarbage(line));
+    const withoutGarbageBlocks = this.removeLowQualityOcrBlocks(lines.join('\n'));
+    const cleaned = this.trimToHighQualityLanguageBlocks(withoutGarbageBlocks);
+    if (cleaned.length > 0 && cleaned.length < text.trim().length) {
+      this.logger.log(`OCR cleanup reduced ${fileName} text from ${text.trim().length} to ${cleaned.length} characters`);
+    }
+    return cleaned || normalized.trim();
+  }
+
+  private normalizeOcrText(text: string): string {
+    return text
+      .normalize('NFKC')
+      .replace(/[ﬀﬁﬂﬃﬄ]/g, (match) => ({ ﬀ: 'ff', ﬁ: 'fi', ﬂ: 'fl', ﬃ: 'ffi', ﬄ: 'ffl' })[match] ?? match)
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, ' ')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/[“”„«»]/g, '"')
+      .replace(/[‘’‚]/g, "'")
+      .replace(/[‐‑‒–—―]/g, '-')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  private isObviousOcrGarbage(line: string): boolean {
+    if (/^[\s|+_=~*#·•:;.,-]{4,}$/.test(line)) {
+      return true;
+    }
+    if (/(.)\1{7,}/u.test(line)) {
+      return true;
+    }
+
+    const metrics = this.ocrTextMetrics(line);
+    const { letters, visible, symbolRatio, gridMarkerRatio, mixedTokenRatio } = metrics;
+    if (visible === 0) {
+      return true;
+    }
+
+    if (line.length >= 8 && letters < 3 && symbolRatio > 0.45) {
+      return true;
+    }
+    if (line.length >= 80 && symbolRatio > 0.35 && this.spellcheck.dictionaryScore(line, 'und') < 0.18) {
+      return true;
+    }
+    if (line.length >= 60 && gridMarkerRatio > 0.16 && mixedTokenRatio > 0.35) {
+      return true;
+    }
+    return false;
+  }
+
+  private removeLowQualityOcrBlocks(text: string): string {
+    return this.ocrQualityBlocks(text)
+      .filter((block) => !this.isLowQualityOcrBlock(block))
+      .join('\n\n')
+      .trim();
+  }
+
+  private isLowQualityOcrBlock(block: string): boolean {
+    const metrics = this.ocrTextMetrics(block);
+    if (metrics.visible === 0) {
+      return true;
+    }
+
+    const dictionaryScore = this.spellcheck.dictionaryScore(block, 'und');
+    const isLongGarbageRun = block.length >= 180 && metrics.symbolRatio > 0.28 && dictionaryScore < 0.22;
+    const isGridArtifact = block.length >= 80 && metrics.gridMarkerRatio > 0.12 && metrics.mixedTokenRatio > 0.3 && dictionaryScore < 0.3;
+    const isMostlyShortCells = block.length >= 80 && metrics.shortTokenRatio > 0.6 && metrics.symbolRatio > 0.22 && dictionaryScore < 0.25;
+    return isLongGarbageRun || isGridArtifact || isMostlyShortCells;
+  }
+
+  private ocrTextMetrics(text: string) {
+    const letters = (text.match(/\p{L}/gu) ?? []).length;
+    const digits = (text.match(/\p{N}/gu) ?? []).length;
+    const symbols = (text.match(/[^\p{L}\p{N}\s]/gu) ?? []).length;
+    const gridMarkers = (text.match(/[|[\]=+_*#~]/g) ?? []).length;
+    const visible = letters + digits + symbols;
+    const tokens = text.split(/\s+/).filter(Boolean);
+    const mixedTokens = tokens.filter((token) => /[|[\]=+_*#~]/.test(token) && /[\p{L}\p{N}]/u.test(token)).length;
+    const shortTokens = tokens.filter((token) => token.length <= 2).length;
+
+    return {
+      letters,
+      visible,
+      symbolRatio: visible ? symbols / visible : 0,
+      gridMarkerRatio: visible ? gridMarkers / visible : 0,
+      mixedTokenRatio: tokens.length ? mixedTokens / tokens.length : 0,
+      shortTokenRatio: tokens.length ? shortTokens / tokens.length : 0,
+    };
+  }
+
+  private trimToHighQualityLanguageBlocks(text: string): string {
+    const blocks = this.ocrQualityBlocks(text);
+    if (blocks.length === 0) {
+      return text.trim();
+    }
+
+    const firstQualityIndex = blocks.findIndex((block) => this.isHighQualityLanguageBlock(block));
+    if (firstQualityIndex < 0) {
+      return text.trim();
+    }
+
+    const lastQualityIndexFromEnd = [...blocks].reverse().findIndex((block) => this.isHighQualityLanguageBlock(block));
+    const lastQualityIndex = blocks.length - 1 - lastQualityIndexFromEnd;
+    return blocks.slice(firstQualityIndex, lastQualityIndex + 1).join('\n\n').trim();
+  }
+
+  private ocrQualityBlocks(text: string): string[] {
+    const paragraphBlocks = text
+      .split(/\n\s*\n/g)
+      .map((block) => block.trim())
+      .filter(Boolean);
+    if (paragraphBlocks.length >= 3) {
+      return paragraphBlocks;
+    }
+
+    const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+    const blocks: string[] = [];
+    for (let index = 0; index < lines.length; index += 8) {
+      blocks.push(lines.slice(index, index + 8).join('\n'));
+    }
+    return blocks.filter(Boolean);
+  }
+
+  private isHighQualityLanguageBlock(block: string): boolean {
+    const words = block.match(/\p{L}[\p{L}'-]{2,}/gu) ?? [];
+    if (words.length < 5) {
+      return false;
+    }
+
+    const language = franc(block, { only: ['deu', 'eng', 'fra'] });
+    const dictionaryScore = this.spellcheck.dictionaryScore(block, language);
+    const languageScore = language === 'und' ? 0 : 1;
+    const sentenceScore = this.sentenceLikeScore(block);
+    const qualityScore = dictionaryScore * 0.55 + languageScore * 0.2 + sentenceScore * 0.25;
+    return qualityScore >= 0.45;
+  }
+
+  private sentenceLikeScore(text: string): number {
+    const words = text.match(/\p{L}[\p{L}'-]{2,}/gu) ?? [];
+    if (words.length === 0) {
+      return 0;
+    }
+
+    const sentenceMarks = (text.match(/[.!?]/g) ?? []).length;
+    const averageWordLength = words.reduce((sum, word) => sum + word.length, 0) / words.length;
+    const hasReasonableWords = averageWordLength >= 3.5 && averageWordLength <= 12 ? 0.5 : 0;
+    const hasSentenceMarks = sentenceMarks > 0 ? 0.3 : 0;
+    const hasEnoughWords = words.length >= 12 ? 0.2 : 0;
+    return hasReasonableWords + hasSentenceMarks + hasEnoughWords;
   }
 
   private async markMissingSourceFilesDeleted(sourceFiles: DropboxPdfFile[]): Promise<number> {
