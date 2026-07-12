@@ -670,6 +670,10 @@ export class DocumentsService {
   }
 
   private async importSourceFile(sourceFile: DropboxPdfFile, counters: SyncCounters, fileStartedAt: number) {
+    const existingMetadata = await this.metadataModel
+      .findOne({ fileName: sourceFile.name })
+      .select('_id status title tags sentAt hasSentDate')
+      .lean();
     const metadata = await this.metadataModel.findOneAndUpdate(
       { fileName: sourceFile.name },
       {
@@ -689,6 +693,10 @@ export class DocumentsService {
       },
       { upsert: true, new: true },
     );
+    const retryingFailedDocument = existingMetadata?.status === 'failed';
+    if (retryingFailedDocument) {
+      await this.chunkModel.deleteMany({ metadataId: metadata._id });
+    }
 
     try {
       await this.emitImportPhase('downloading', sourceFile.name, counters, fileStartedAt);
@@ -721,16 +729,20 @@ export class DocumentsService {
       await this.emitImportPhase('storing', sourceFile.name, counters, fileStartedAt);
       const fileNameTerms = normalizeTerms(sourceFile.name);
       const fileNamePartialTerms = buildPartialTerms(sourceFile.name);
+      const titleTerms = metadata.title ? normalizeTerms(metadata.title) : [];
+      const titlePartialTerms = metadata.title ? buildPartialTerms(metadata.title) : [];
       const tags = metadata.tags ?? [];
-      await this.chunkModel.deleteMany({ metadataId: metadata._id });
+      if (!retryingFailedDocument) {
+        await this.chunkModel.deleteMany({ metadataId: metadata._id });
+      }
       await this.chunkModel.insertMany(
         chunks.map((text, index) => ({
           metadataId: metadata._id,
           fileName: sourceFile.name,
           chunkIndex: index,
           text,
-          terms: Array.from(new Set([...normalizeTerms(text), ...fileNameTerms])),
-          partialTerms: Array.from(new Set([...buildPartialTerms(text), ...fileNamePartialTerms])),
+          terms: Array.from(new Set([...normalizeTerms(text), ...fileNameTerms, ...titleTerms])),
+          partialTerms: Array.from(new Set([...buildPartialTerms(text), ...fileNamePartialTerms, ...titlePartialTerms])),
           tags,
           ...(vectorSearchEnabled ? { embedding: vectors[index] } : {}),
           deleted: false,
@@ -738,6 +750,8 @@ export class DocumentsService {
       );
 
       const pdfUrl = await this.dropbox.getDirectDownloadLink(sourceFile.pathDisplay);
+      const preservedSentAt = metadata.sentAt;
+      const effectiveSentAt = preservedSentAt ?? sentAt;
       await this.metadataModel.updateOne(
         { _id: metadata._id },
         {
@@ -749,11 +763,11 @@ export class DocumentsService {
             ocrRotationAngle: extracted.rotationAngle,
             processedAt: new Date(),
             modifiedAtDropbox: this.syncDate(sourceFile),
-            hasSentDate: Boolean(sentAt),
-            ...(sentAt ? { sentAt } : {}),
+            hasSentDate: Boolean(effectiveSentAt),
+            ...(effectiveSentAt ? { sentAt: effectiveSentAt } : {}),
             pdfUrl,
           },
-          $unset: { error: '', ...(sentAt ? {} : { sentAt: '' }) },
+          $unset: { error: '', ...(effectiveSentAt ? {} : { sentAt: '' }) },
         },
       );
     } catch (error) {
@@ -815,6 +829,8 @@ export class DocumentsService {
     return text
       .normalize('NFKC')
       .replace(/[ﬀﬁﬂﬃﬄ]/g, (match) => ({ ﬀ: 'ff', ﬁ: 'fi', ﬂ: 'fl', ﬃ: 'ffi', ﬄ: 'ffl' })[match] ?? match)
+      // OCR output can contain raw control bytes; strip them before tokenizing.
+      // eslint-disable-next-line no-control-regex
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, ' ')
       .replace(/[\u200B-\u200D\uFEFF]/g, '')
       .replace(/[“”„«»]/g, '"')

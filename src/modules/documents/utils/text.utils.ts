@@ -35,15 +35,59 @@ export function chunkText(text: string, size = 1000, overlap = 150): string[] {
   let start = 0;
 
   while (start < normalized.length) {
-    const end = Math.min(start + size, normalized.length);
+    const end = findWordBoundaryEnd(normalized, Math.min(start + size, normalized.length));
     chunks.push(normalized.slice(start, end).trim());
     if (end === normalized.length) {
       break;
     }
-    start = Math.max(end - overlap, start + 1);
+    start = findWordBoundaryStart(normalized, Math.max(end - overlap, start + 1));
   }
 
   return chunks;
+}
+
+function findWordBoundaryEnd(text: string, targetEnd: number): number {
+  if (targetEnd >= text.length) {
+    return text.length;
+  }
+  if (!isInsideWord(text, targetEnd)) {
+    return targetEnd;
+  }
+
+  let end = targetEnd;
+  while (end < text.length && isWordCharacter(text[end])) {
+    end += 1;
+  }
+  return end;
+}
+
+function findWordBoundaryStart(text: string, targetStart: number): number {
+  if (targetStart <= 0) {
+    return 0;
+  }
+  if (targetStart >= text.length) {
+    return text.length;
+  }
+  if (!isInsideWord(text, targetStart)) {
+    return targetStart;
+  }
+
+  let start = targetStart;
+  while (start < text.length && isWordCharacter(text[start])) {
+    start += 1;
+  }
+  while (start < text.length && /\s/u.test(text[start])) {
+    start += 1;
+  }
+  return start;
+}
+
+function isInsideWord(text: string, index: number): boolean {
+  return isWordCharacter(text[index - 1]) && isWordCharacter(text[index]);
+}
+
+function isWordCharacter(character: string | undefined): boolean {
+  return Boolean(character && /[\p{L}\p{N}]/u.test(character));
 }
 
 export function mergeOverlappingChunks(chunks: string[], minOverlap = 20, maxOverlap = 250): string {
