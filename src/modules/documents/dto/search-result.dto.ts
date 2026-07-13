@@ -7,6 +7,7 @@ export interface SearchResultItem {
   createdAt?: string;
   modifiedAt?: string;
   sentAt?: string;
+  sentLocation?: string;
   hasSentDate: boolean;
   sender?: string;
   recipient?: string;

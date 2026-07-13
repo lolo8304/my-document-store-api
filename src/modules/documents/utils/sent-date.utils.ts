@@ -50,6 +50,10 @@ export function detectSentDate(text: string, language: string): Date | undefined
   return detectSentDateInText(firstQuarter(text), language) ?? detectSentDateInText(lastTenth(text), language);
 }
 
+export function detectDateInText(text: string, language: string): Date | undefined {
+  return detectSentDateInText(text, language);
+}
+
 function detectSentDateInText(text: string, language: string): Date | undefined {
   const numericMatch = firstValidNumericDate(text);
   if (numericMatch) {

@@ -53,6 +53,9 @@ export class DocumentsMetadata {
   @Prop({ index: true })
   sentAt?: Date;
 
+  @Prop()
+  sentLocation?: string;
+
   @Prop({ index: true })
   hasSentDate?: boolean;
 

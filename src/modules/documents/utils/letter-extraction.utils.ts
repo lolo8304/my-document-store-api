@@ -1,9 +1,10 @@
-import { detectSentDate } from './sent-date.utils';
+import { detectDateInText, detectSentDate } from './sent-date.utils';
 
 export interface LetterFields {
   sender?: string;
   recipient?: string;
   sentAt?: Date;
+  sentLocation?: string;
   subject?: string;
   referenceNumber?: string;
   invoiceNumber?: string;
@@ -32,10 +33,12 @@ export interface LetterLayoutLine {
   y0: number;
   x1: number;
   y1: number;
+  sourceRectangles?: LetterLayoutLine[];
 }
 
 export interface LetterLayoutPage {
   lines: LetterLayoutLine[];
+  groupedMetadata?: boolean;
 }
 
 const senderLabel = /^(?:absender|sender|from|expediteur|expéditeur)\s*:?\s*(.*)$/iu;
@@ -44,7 +47,7 @@ const subjectLabel = /^(?:betreff|subject|objet)\s*:?\s*(.*)$/iu;
 
 const referencePatterns = [
   /\b(REF(?:[-_/][A-Z0-9][A-Z0-9./_-]{2,}|\d[A-Z0-9./_-]{2,}))\b/iu,
-  /\b(?:referenz|ref(?:erence)?|zeichen|dossier)\s*(?:nr\.?|number|no\.?|#)?\s*[:.-]?\s*([A-Z0-9][A-Z0-9./_-]{2,})\b/iu,
+  /\b(?:referenz|reference|ref|zeichen|dossier)\b\s*(?:nr\.?|number|no\.?|#)?\s*[:.-]?\s*([A-Z0-9][A-Z0-9./_-]{2,})\b/iu,
 ];
 const invoicePatterns = [
   /\b(?:rechnung|invoice|facture)\s*(?:nr\.?|number|no\.?|#)?\s*[:.-]?\s*([A-Z0-9][A-Z0-9./_-]{2,})\b/iu,
@@ -58,6 +61,8 @@ const accountPatterns = [
 ];
 const deadlineLabels = /\b(?:frist|deadline|response due|reply by|antwort bis|reponse avant|réponse avant)\b/iu;
 const paymentDueLabels = /\b(?:zahlbar bis|zahlung bis|fällig|faellig|due date|payment due|echeance|échéance)\b/iu;
+const datePositionScoreWeight = 0.7;
+const dateShortnessScoreWeight = 0.3;
 const receiverAnchorTerms = [
   'doris hänggi',
   'doris hanggi',
@@ -83,25 +88,47 @@ export function extractLetterFields(text: string, language: string, layoutPages:
 export function extractLetterMetadata(text: string, language: string, layoutPages: LetterLayoutPage[] = []): LetterExtractionResult {
   const lines = meaningfulLines(text);
   const topLines = lines.slice(0, 40);
+  const groupedMetadata = layoutPages[0]?.groupedMetadata === true;
+  const groupedUnits = groupedMetadata ? groupedMetadataTextUnits(layoutPages[0]) : [];
+  const groupedTopUnits = groupedUnits.slice(0, 40);
   const layout = extractLayoutLetterFields(layoutPages[0], language);
   const sender =
     detectedValue('sender', layout) ??
-    detectLabeledBlock(topLines, senderLabel, 'sender') ??
-    detectTopSenderFallback(topLines);
-  const recipient = detectedValue('recipient', layout) ?? detectLabeledBlock(topLines, recipientLabel, 'recipient');
+    (groupedMetadata ? detectLabeledBlockInUnits(groupedTopUnits, senderLabel, 'sender') : detectLabeledBlock(topLines, senderLabel, 'sender')) ??
+    (groupedMetadata ? detectTopSenderFallbackInUnits(groupedTopUnits) : detectTopSenderFallback(topLines));
+  const recipient =
+    detectedValue('recipient', layout) ??
+    (groupedMetadata ? detectLabeledBlockInUnits(groupedTopUnits, recipientLabel, 'recipient') : detectLabeledBlock(topLines, recipientLabel, 'recipient'));
   const sentAt =
     detectedValue('sentAt', layout) ??
-    detectLetterDate(topLines, language) ??
-    detectWholeTextDate(text, language);
-  const subject = detectedValue('subject', layout) ?? detectLabeledValue(topLines, subjectLabel, 'subject');
-  const referenceNumber = detectFirstPattern(text, referencePatterns, 'referenceNumber');
-  const invoiceNumber = detectFirstPattern(text, invoicePatterns, 'invoiceNumber');
-  const customerNumber = detectFirstPattern(text, customerPatterns, 'customerNumber');
-  const accountNumber = normalizeDetectedIdentifier(detectFirstPattern(text, accountPatterns, 'accountNumber'));
-  const deadlineAt = detectLabeledDate(lines, deadlineLabels, language, 'deadlineAt');
-  const paymentDueAt = detectLabeledDate(lines, paymentDueLabels, language, 'paymentDueAt');
+    (groupedMetadata ? detectLetterDateInUnits(groupedTopUnits, language) : detectLetterDate(topLines, language)) ??
+    (groupedMetadata ? undefined : detectWholeTextDate(text, language));
+  const sentLocation =
+    detectedValue('sentLocation', layout) ??
+    (groupedMetadata ? detectLetterDateLocationInUnits(groupedTopUnits, language) : detectLetterDateLocation(topLines, language));
+  const subject =
+    detectedValue('subject', layout) ??
+    (groupedMetadata ? detectLabeledBlockInUnits(groupedTopUnits, subjectLabel, 'subject') : detectLabeledValue(topLines, subjectLabel, 'subject'));
+  const referenceNumber = groupedMetadata
+    ? detectFirstPatternInUnits(groupedUnits, referencePatterns, 'referenceNumber')
+    : detectFirstPattern(text, referencePatterns, 'referenceNumber');
+  const invoiceNumber = groupedMetadata
+    ? detectFirstPatternInUnits(groupedUnits, invoicePatterns, 'invoiceNumber')
+    : detectFirstPattern(text, invoicePatterns, 'invoiceNumber');
+  const customerNumber = groupedMetadata
+    ? detectFirstPatternInUnits(groupedUnits, customerPatterns, 'customerNumber')
+    : detectFirstPattern(text, customerPatterns, 'customerNumber');
+  const accountNumber = normalizeDetectedIdentifier(
+    groupedMetadata ? detectFirstPatternInUnits(groupedUnits, accountPatterns, 'accountNumber') : detectFirstPattern(text, accountPatterns, 'accountNumber'),
+  );
+  const deadlineAt = groupedMetadata
+    ? detectLabeledDateInUnits(groupedUnits, deadlineLabels, language, 'deadlineAt')
+    : detectLabeledDate(lines, deadlineLabels, language, 'deadlineAt');
+  const paymentDueAt = groupedMetadata
+    ? detectLabeledDateInUnits(groupedUnits, paymentDueLabels, language, 'paymentDueAt')
+    : detectLabeledDate(lines, paymentDueLabels, language, 'paymentDueAt');
 
-  const detections = [sender, recipient, sentAt, subject, referenceNumber, invoiceNumber, customerNumber, accountNumber, deadlineAt, paymentDueAt];
+  const detections = [sender, recipient, sentAt, sentLocation, subject, referenceNumber, invoiceNumber, customerNumber, accountNumber, deadlineAt, paymentDueAt];
   return {
     fields: removeEmptyFields(Object.fromEntries(detections.filter(Boolean).map((detection) => [detection!.field, detection!.value])) as LetterFields),
     sources: Object.fromEntries(detections.filter(Boolean).map((detection) => [detection!.field, detection!.source])),
@@ -112,6 +139,7 @@ export function letterFieldsSearchText(fields: LetterFields): string {
   return [
     fields.sender,
     fields.recipient,
+    fields.sentLocation,
     fields.subject,
     fields.referenceNumber,
     fields.invoiceNumber,
@@ -133,6 +161,16 @@ interface DetectedLetterField<T extends string | Date = string | Date> {
   field: LetterFieldName;
   value: T;
   source: LetterFieldSource;
+}
+
+interface ScoredLayoutDateCandidate {
+  line: LetterLayoutLine;
+  date: Date;
+  location?: string;
+  score: number;
+  positionScore: number;
+  shortnessScore: number;
+  origin: 'green' | 'orange';
 }
 
 function detectedValue(field: LetterFieldName, result: LetterExtractionResult): DetectedLetterField | undefined {
@@ -158,6 +196,14 @@ function detectLabeledValue(lines: string[], label: RegExp, field: LetterFieldNa
     }
   }
   return undefined;
+}
+
+function detectLabeledBlockInUnits(units: string[], label: RegExp, field: LetterFieldName): DetectedLetterField<string> | undefined {
+  return detectInGroupedUnits(units, (unit) => detectLabeledBlock(meaningfulLines(unit), label, field));
+}
+
+function detectTopSenderFallbackInUnits(units: string[]): DetectedLetterField<string> | undefined {
+  return detectInGroupedUnits(units, (unit) => detectTopSenderFallback(meaningfulLines(unit)));
 }
 
 function detectLabeledBlock(lines: string[], label: RegExp, field: LetterFieldName): DetectedLetterField<string> | undefined {
@@ -241,20 +287,26 @@ function detectFirstPattern(text: string, patterns: RegExp[], field: LetterField
   return undefined;
 }
 
+function detectFirstPatternInUnits(units: string[], patterns: RegExp[], field: LetterFieldName): DetectedLetterField<string> | undefined {
+  return detectInGroupedUnits(units, (unit) => detectFirstPattern(unit, patterns, field));
+}
+
 function detectLabeledDate(lines: string[], label: RegExp, language: string, field: LetterFieldName): DetectedLetterField<Date> | undefined {
   for (const [index, line] of lines.entries()) {
     if (!label.test(line)) {
       continue;
     }
-    const date = parseNumericDate(line) ?? detectSentDate(line, language);
+    const searchLines = lines.slice(index, index + 4);
+    const searchText = searchLines.join(' ');
+    const date = parseNumericDate(searchText) ?? detectDateInText(searchText, language);
     if (date) {
       return {
         field,
         value: date,
         source: {
           method: 'label',
-          location: `text line ${index + 1}`,
-          detail: `Matched date label in "${truncateSourceLine(line)}"`,
+          location: `text lines ${index + 1}-${index + searchLines.length}`,
+          detail: `Matched date label in "${truncateSourceLine(searchText)}"`,
         },
       };
     }
@@ -262,12 +314,16 @@ function detectLabeledDate(lines: string[], label: RegExp, language: string, fie
   return undefined;
 }
 
+function detectLabeledDateInUnits(units: string[], label: RegExp, language: string, field: LetterFieldName): DetectedLetterField<Date> | undefined {
+  return detectInGroupedUnits(units, (unit) => detectLabeledDate(meaningfulLines(unit), label, language, field));
+}
+
 function detectLetterDate(lines: string[], language: string): DetectedLetterField<Date> | undefined {
   for (const [index, line] of lines.entries()) {
     if (deadlineLabels.test(line) || paymentDueLabels.test(line)) {
       continue;
     }
-    const date = parseNumericDate(line) ?? detectSentDate(line, language);
+    const date = parseNumericDate(line) ?? detectDateInText(line, language);
     if (date) {
       return {
         field: 'sentAt',
@@ -281,6 +337,36 @@ function detectLetterDate(lines: string[], language: string): DetectedLetterFiel
     }
   }
   return undefined;
+}
+
+function detectLetterDateInUnits(units: string[], language: string): DetectedLetterField<Date> | undefined {
+  return detectInGroupedUnits(units, (unit) => detectLetterDate(meaningfulLines(unit), language));
+}
+
+function detectLetterDateLocation(lines: string[], language: string): DetectedLetterField<string> | undefined {
+  for (const [index, line] of lines.entries()) {
+    if (deadlineLabels.test(line) || paymentDueLabels.test(line)) {
+      continue;
+    }
+    const date = parseNumericDate(line) ?? detectDateInText(line, language);
+    const location = date ? extractSentLocation(line) : undefined;
+    if (location) {
+      return {
+        field: 'sentLocation',
+        value: location,
+        source: {
+          method: 'pattern',
+          location: `top text line ${index + 1}`,
+          detail: `Matched sent location in "${truncateSourceLine(line)}"`,
+        },
+      };
+    }
+  }
+  return undefined;
+}
+
+function detectLetterDateLocationInUnits(units: string[], language: string): DetectedLetterField<string> | undefined {
+  return detectInGroupedUnits(units, (unit) => detectLetterDateLocation(meaningfulLines(unit), language));
 }
 
 function detectWholeTextDate(text: string, language: string): DetectedLetterField<Date> | undefined {
@@ -306,7 +392,8 @@ function normalizeDetectedIdentifier(detection: DetectedLetterField<string> | un
 }
 
 function extractLayoutLetterFields(page: LetterLayoutPage | undefined, language: string): LetterExtractionResult {
-  const lines = normalizedLayoutLines(page);
+  const groupedMetadata = page?.groupedMetadata === true;
+  const lines = normalizedLayoutLines(page, groupedMetadata);
   if (lines.length === 0) {
     return { fields: {}, sources: {} };
   }
@@ -319,15 +406,25 @@ function extractLayoutLetterFields(page: LetterLayoutPage | undefined, language:
   const subjectLine = topLines.find((line) => subjectLabel.test(line.text));
   const subjectY = subjectLine?.y0;
   const anchoredRecipientLines = findReceiverAnchorBlock(topLines, height);
-  const sender = extractLayoutSender(topLeftLines, height, anchoredRecipientLines);
-  const recipient = extractLayoutRecipient(topLeftLines, height, subjectY ?? height * 0.9, anchoredRecipientLines);
-  const sentAt = extractLayoutDate(topRightLines, language) ?? extractLayoutDate(topLines, language);
+  const sender =
+    (groupedMetadata
+      ? extractLayoutSenderWithinRectangle(topLeftLines, height, anchoredRecipientLines)
+      : extractLayoutSender(topLeftLines, height, anchoredRecipientLines)) ?? extractLayoutFooterSender(lines, width, height, anchoredRecipientLines);
+  const recipient = groupedMetadata
+    ? extractLayoutRecipientWithinRectangle(topLeftLines, height, subjectY ?? height * 0.9, anchoredRecipientLines)
+    : extractLayoutRecipient(topLeftLines, height, subjectY ?? height * 0.9, anchoredRecipientLines);
+  const scoredDateCandidate = groupedMetadata ? extractScoredLayoutDateCandidate(lines, language, height) : undefined;
+  const sentAt = scoredDateCandidate ? scoredLayoutDate(scoredDateCandidate) : extractLayoutDate(topRightLines, language) ?? extractLayoutDate(topLines, language);
+  const sentLocation = scoredDateCandidate?.location
+    ? scoredLayoutDateLocation(scoredDateCandidate)
+    : extractLayoutDateLocation(topRightLines, language) ?? extractLayoutDateLocation(topLines, language);
   const subject = subjectLine ? cleanValue(subjectLabel.exec(subjectLine.text)?.[1]) : extractLayoutSubject(topLines, recipient?.value, subjectY);
 
   const detections: Array<DetectedLetterField | undefined> = [
     sender,
     recipient,
     sentAt,
+    sentLocation,
     subject
       ? {
           field: 'subject',
@@ -346,11 +443,47 @@ function extractLayoutLetterFields(page: LetterLayoutPage | undefined, language:
   };
 }
 
-function normalizedLayoutLines(page: LetterLayoutPage | undefined): LetterLayoutLine[] {
+function normalizedLayoutLines(page: LetterLayoutPage | undefined, preserveNewLines = false): LetterLayoutLine[] {
   return (page?.lines ?? [])
-    .map((line) => ({ ...line, text: line.text.replace(/\s+/g, ' ').trim() }))
+    .map((line) => ({ ...line, text: normalizeLayoutLineText(line.text, preserveNewLines) }))
     .filter((line) => line.text.length >= 2)
     .sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+}
+
+function groupedMetadataTextUnits(page: LetterLayoutPage | undefined): string[] {
+  return normalizedLayoutLines(page, true).map((line) => line.text);
+}
+
+function detectInGroupedUnits<T extends string | Date>(
+  units: string[],
+  detector: (unit: string) => DetectedLetterField<T> | undefined,
+): DetectedLetterField<T> | undefined {
+  for (const [index, unit] of units.entries()) {
+    const detection = detector(unit);
+    if (detection) {
+      return {
+        ...detection,
+        source: {
+          ...detection.source,
+          location: `green rectangle ${index + 1}; ${detection.source.location}`,
+          detail: detection.source.detail ? `${detection.source.detail}; constrained to one grouped rectangle` : 'Constrained to one grouped rectangle',
+        },
+      };
+    }
+  }
+  return undefined;
+}
+
+function normalizeLayoutLineText(text: string, preserveNewLines: boolean): string {
+  if (!preserveNewLines) {
+    return text.replace(/\s+/g, ' ').trim();
+  }
+
+  return text
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
 }
 
 function extractLayoutSender(
@@ -362,7 +495,7 @@ function extractLayoutSender(
   const candidates = lines
     .filter((line) => line.y0 <= pageHeight * 0.45)
     .filter((line) => /[\p{L}]{3,}/u.test(line.text) || isSenderContactLine(line.text))
-    .filter((line) => !parseNumericDate(line.text) && !isLikelyNewSection(line.text))
+    .filter((line) => !parseNumericDate(line.text) && !isLikelyNewSection(line.text) && !isGreetingLine(line.text))
     .filter((line) => !isContactLine(line.text) || isSenderContactLine(line.text))
     .filter((line) => !recipientLineKeys.has(layoutLineKey(line)) && !hasReceiverAnchor(line.text));
   const selected = selectSenderLines(candidates);
@@ -375,6 +508,64 @@ function extractLayoutSender(
           method: 'layout',
           location: `page 1 top-left/header zone ${linesLocation(selected)}`,
           detail: 'Selected plausible sender lines from first-page header area',
+        },
+      }
+    : undefined;
+}
+
+function extractLayoutSenderWithinRectangle(
+  lines: LetterLayoutLine[],
+  pageHeight: number,
+  anchoredRecipientLines: LetterLayoutLine[],
+): DetectedLetterField<string> | undefined {
+  const recipientLineKeys = new Set(anchoredRecipientLines.map(layoutLineKey));
+  const selected = lines
+    .filter((line) => line.y0 <= pageHeight * 0.45)
+    .filter((line) => /[\p{L}]{3,}/u.test(line.text) || isSenderContactLine(line.text))
+    .filter((line) => !parseNumericDate(line.text) && !isLikelyNewSection(line.text) && !isGreetingLine(line.text))
+    .filter((line) => !isContactLine(line.text) || isSenderContactLine(line.text))
+    .filter((line) => !recipientLineKeys.has(layoutLineKey(line)) && !hasReceiverAnchor(line.text))
+    .sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)[0];
+  const value = cleanFieldValue(selected?.text, 'sender');
+  return value && selected
+    ? {
+        field: 'sender',
+        value,
+        source: {
+          method: 'layout',
+          location: `page 1 top-left/header green rectangle ${bboxLocation(selected)}`,
+          detail: 'Selected sender within one grouped rectangle',
+        },
+      }
+    : undefined;
+}
+
+function extractLayoutFooterSender(
+  lines: LetterLayoutLine[],
+  pageWidth: number,
+  pageHeight: number,
+  anchoredRecipientLines: LetterLayoutLine[],
+): DetectedLetterField<string> | undefined {
+  const recipientLineKeys = new Set(anchoredRecipientLines.map(layoutLineKey));
+  const selected = lines
+    .filter((line) => line.y0 >= pageHeight * 0.88)
+    .filter((line) => line.x0 <= pageWidth * 0.75)
+    .filter((line) => !recipientLineKeys.has(layoutLineKey(line)) && !hasReceiverAnchor(line.text))
+    .map((line) => ({ ...line, text: cleanFooterSenderLine(line.text) ?? '' }))
+    .filter((line) => /[\p{L}]{3,}/u.test(line.text))
+    .filter((line) => !parseNumericDate(line.text) && !isLikelyNewSection(line.text) && !isGreetingLine(line.text))
+    .sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)
+    .slice(0, 2);
+
+  const value = cleanFieldValue(joinFieldLines(selected.map((line) => line.text), 'sender'), 'sender');
+  return value
+    ? {
+        field: 'sender',
+        value,
+        source: {
+          method: 'layout',
+          location: `page 1 bottom/footer zone ${linesLocation(selected)}`,
+          detail: 'No header sender found; selected bottom footer line(s) as sender',
         },
       }
     : undefined;
@@ -409,12 +600,40 @@ function extractLayoutRecipient(
     : undefined;
 }
 
+function extractLayoutRecipientWithinRectangle(
+  lines: LetterLayoutLine[],
+  pageHeight: number,
+  subjectY: number,
+  anchoredRecipientLines: LetterLayoutLine[],
+): DetectedLetterField<string> | undefined {
+  const candidates = anchoredRecipientLines.length > 0 ? anchoredRecipientLines : lines
+    .filter((line) => line.y0 >= pageHeight * 0.25 && line.y0 < Math.min(subjectY, pageHeight * 0.85))
+    .filter((line) => /[\p{L}]{2,}/u.test(line.text))
+    .filter((line) => !isContactLine(line.text) && !isSenderContactLine(line.text) && !parseNumericDate(line.text) && !isLikelyNewSection(line.text));
+  const selected = candidates.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)[0];
+  const value = cleanFieldValue(selected?.text, 'recipient');
+  return value && selected
+    ? {
+        field: 'recipient',
+        value,
+        source: {
+          method: 'layout',
+          location: `page 1 recipient green rectangle ${bboxLocation(selected)}`,
+          detail:
+            anchoredRecipientLines.length > 0
+              ? `Selected one grouped rectangle because it contains known receiver anchor text: ${receiverAnchorTerms.join(', ')}`
+              : 'Selected recipient from one grouped rectangle before subject area',
+        },
+      }
+    : undefined;
+}
+
 function extractLayoutDate(lines: LetterLayoutLine[], language: string): DetectedLetterField<Date> | undefined {
   for (const line of lines) {
     if (deadlineLabels.test(line.text) || paymentDueLabels.test(line.text)) {
       continue;
     }
-    const date = parseNumericDate(line.text) ?? detectSentDate(line.text, language);
+    const date = parseNumericDate(line.text) ?? detectDateInText(line.text, language);
     if (date) {
       return {
         field: 'sentAt',
@@ -423,6 +642,108 @@ function extractLayoutDate(lines: LetterLayoutLine[], language: string): Detecte
           method: 'layout',
           location: `page 1 date zone ${bboxLocation(line)}`,
           detail: `Matched date in "${truncateSourceLine(line.text)}"`,
+        },
+      };
+    }
+  }
+  return undefined;
+}
+
+function extractScoredLayoutDateCandidate(
+  lines: LetterLayoutLine[],
+  language: string,
+  pageHeight: number,
+): ScoredLayoutDateCandidate | undefined {
+  const candidates = lines
+    .flatMap((line) => [
+      ...dateCandidatesFromLine(line, language, 'green'),
+      ...(line.sourceRectangles && line.sourceRectangles.length > 1
+        ? line.sourceRectangles.flatMap((source) => dateCandidatesFromLine(source, language, 'orange'))
+        : []),
+    ]);
+
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  const textLengths = candidates.map((candidate) => normalizedTextLength(candidate.line.text));
+  const minTextLength = Math.min(...textLengths);
+  const maxTextLength = Math.max(...textLengths);
+
+  return candidates
+    .map((candidate) => {
+      const positionScore = clampScore(1 - candidate.line.y0 / pageHeight);
+      const shortnessScore = scoreShortest(normalizedTextLength(candidate.line.text), minTextLength, maxTextLength);
+      return {
+        ...candidate,
+        positionScore,
+        shortnessScore,
+        score: positionScore * datePositionScoreWeight + shortnessScore * dateShortnessScoreWeight,
+      };
+    })
+    .sort((a, b) => b.score - a.score || a.line.y0 - b.line.y0 || normalizedTextLength(a.line.text) - normalizedTextLength(b.line.text))[0];
+}
+
+function dateCandidatesFromLine(
+  line: LetterLayoutLine,
+  language: string,
+  origin: 'green' | 'orange',
+): Array<Pick<ScoredLayoutDateCandidate, 'line' | 'date' | 'location' | 'origin'>> {
+  if (deadlineLabels.test(line.text) || paymentDueLabels.test(line.text)) {
+    return [];
+  }
+  const date = parseNumericDate(line.text) ?? detectDateInText(line.text, language);
+  return date
+    ? [{
+        line: { ...line, sourceRectangles: undefined },
+        date,
+        location: extractSentLocation(line.text),
+        origin,
+      }]
+    : [];
+}
+
+function scoredLayoutDate(candidate: ScoredLayoutDateCandidate): DetectedLetterField<Date> {
+  return {
+    field: 'sentAt',
+    value: candidate.date,
+    source: {
+      method: 'layout',
+      location: `page 1 scored date ${candidate.origin} rectangle ${bboxLocation(candidate.line)}`,
+      detail: `Score ${candidate.score.toFixed(2)} (position ${candidate.positionScore.toFixed(2)}, shortest ${candidate.shortnessScore.toFixed(2)}) for "${truncateSourceLine(candidate.line.text)}"`,
+    },
+  };
+}
+
+function scoredLayoutDateLocation(candidate: ScoredLayoutDateCandidate): DetectedLetterField<string> | undefined {
+  return candidate.location
+    ? {
+        field: 'sentLocation',
+        value: candidate.location,
+        source: {
+          method: 'layout',
+          location: `page 1 scored date location ${candidate.origin} rectangle ${bboxLocation(candidate.line)}`,
+          detail: `Score ${candidate.score.toFixed(2)} (position ${candidate.positionScore.toFixed(2)}, shortest ${candidate.shortnessScore.toFixed(2)}) for "${truncateSourceLine(candidate.line.text)}"`,
+        },
+      }
+    : undefined;
+}
+
+function extractLayoutDateLocation(lines: LetterLayoutLine[], language: string): DetectedLetterField<string> | undefined {
+  for (const line of lines) {
+    if (deadlineLabels.test(line.text) || paymentDueLabels.test(line.text)) {
+      continue;
+    }
+    const date = parseNumericDate(line.text) ?? detectDateInText(line.text, language);
+    const location = date ? extractSentLocation(line.text) : undefined;
+    if (location) {
+      return {
+        field: 'sentLocation',
+        value: location,
+        source: {
+          method: 'layout',
+          location: `page 1 date location zone ${bboxLocation(line)}`,
+          detail: `Matched sent location in "${truncateSourceLine(line.text)}"`,
         },
       };
     }
@@ -514,6 +835,19 @@ function isSenderContactLine(line: string): boolean {
   );
 }
 
+function isGreetingLine(line: string): boolean {
+  return /^(?:sehr geehrte|sehr geehrter|dear|bonjour|madame|monsieur)\b/iu.test(line.trim());
+}
+
+function cleanFooterSenderLine(line: string): string | undefined {
+  return cleanValue(
+    line
+      .replace(/\b(?:seite|page)\s+\d+\s+(?:von|of|\/)\s+\d+\b.*$/iu, '')
+      .replace(/\b\d+\s*\/\s*\d+\b.*$/u, '')
+      .trim(),
+  );
+}
+
 function bboxLocation(line: LetterLayoutLine): string {
   return `bbox(${Math.round(line.x0)},${Math.round(line.y0)},${Math.round(line.x1)},${Math.round(line.y1)})`;
 }
@@ -546,6 +880,21 @@ function truncateSourceLine(value: string): string {
   return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
 }
 
+function normalizedTextLength(value: string): number {
+  return value.replace(/\s+/g, ' ').trim().length;
+}
+
+function scoreShortest(value: number, min: number, max: number): number {
+  if (max <= min) {
+    return 1;
+  }
+  return clampScore(1 - (value - min) / (max - min));
+}
+
+function clampScore(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
+
 function joinFieldLines(lines: string[], field: LetterFieldName): string {
   return lines.join(field === 'sender' || field === 'recipient' ? '\n' : ', ');
 }
@@ -561,6 +910,22 @@ function parseNumericDate(text: string): Date | undefined {
   const day = Number(startsWithYear ? match[3] : match[1]);
   const date = new Date(Date.UTC(year, month, day));
   return date.getUTCFullYear() === year && date.getUTCMonth() === month && date.getUTCDate() === day ? date : undefined;
+}
+
+function extractSentLocation(text: string): string | undefined {
+  const dateMatch =
+    /\b(?:[0-3]?\d\.[01]?\d\.\d{4}|\d{4}-[01]\d-[0-3]\d)\b/u.exec(text) ??
+    /\b[0-3]?\d\.\s*[A-Za-zÀ-ÖØ-öø-ÿ]{3,}\.?\s+\d{4}\b/u.exec(text);
+  if (!dateMatch || dateMatch.index === 0) {
+    return undefined;
+  }
+
+  const beforeDate = text.slice(0, dateMatch.index).replace(/[,;:\s-]+$/u, '').trim();
+  if (!/\p{L}{2,}/u.test(beforeDate)) {
+    return undefined;
+  }
+
+  return cleanValue(beforeDate);
 }
 
 function cleanValue(value?: string): string | undefined {

@@ -15,7 +15,7 @@ import { DocumentChunk } from './schemas/document-chunk.schema';
 import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
 import { SyncProgressEvent, SyncProgressGateway } from './sync-progress.gateway';
-import { extractLetterMetadata, LetterExtractionResult, LetterFields, letterFieldsSearchText } from './utils/letter-extraction.utils';
+import { extractLetterMetadata, LetterExtractionResult, LetterFields, LetterLayoutPage, letterFieldsSearchText } from './utils/letter-extraction.utils';
 import { detectSentDate, formatSentDate, parseSentDateInput } from './utils/sent-date.utils';
 import { buildExcerpt, buildMultiTermExcerpt, buildPartialTerms, chunkText, mergeOverlappingChunks, normalizeTerms } from './utils/text.utils';
 import { SettingsService } from '../settings/settings.service';
@@ -152,7 +152,20 @@ export class DocumentsService {
   }
 
   async updateDocument(id: string, dto: UpdateDocumentDto) {
-    if (dto.title === undefined && dto.tags === undefined && dto.sentAt === undefined) {
+    const metadataFieldNames = [
+      'sender',
+      'recipient',
+      'sentLocation',
+      'subject',
+      'referenceNumber',
+      'invoiceNumber',
+      'customerNumber',
+      'accountNumber',
+      'deadlineAt',
+      'paymentDueAt',
+    ] as const;
+    const hasMetadataUpdate = metadataFieldNames.some((field) => dto[field] !== undefined);
+    if (dto.title === undefined && dto.tags === undefined && dto.sentAt === undefined && dto.clearMetadata !== true && !hasMetadataUpdate) {
       throw new BadRequestException('No document updates provided');
     }
 
@@ -167,11 +180,31 @@ export class DocumentsService {
     if (dto.sentAt !== undefined && dto.sentAt !== null && !nextSentAt) {
       throw new BadRequestException('Sent date must use yyyy-MM-dd');
     }
+    const nextDeadlineAt = dto.deadlineAt === undefined || dto.deadlineAt === null ? undefined : parseSentDateInput(dto.deadlineAt);
+    if (dto.deadlineAt !== undefined && dto.deadlineAt !== null && !nextDeadlineAt) {
+      throw new BadRequestException('Deadline must use yyyy-MM-dd');
+    }
+    const nextPaymentDueAt = dto.paymentDueAt === undefined || dto.paymentDueAt === null ? undefined : parseSentDateInput(dto.paymentDueAt);
+    if (dto.paymentDueAt !== undefined && dto.paymentDueAt !== null && !nextPaymentDueAt) {
+      throw new BadRequestException('Payment due date must use yyyy-MM-dd');
+    }
+    const metadataStringUpdates = {
+      sender: this.cleanManualMetadataValue(dto.sender),
+      recipient: this.cleanManualMetadataValue(dto.recipient),
+      sentLocation: this.cleanManualMetadataValue(dto.sentLocation),
+      subject: this.cleanManualMetadataValue(dto.subject),
+      referenceNumber: this.cleanManualMetadataValue(dto.referenceNumber),
+      invoiceNumber: this.cleanManualMetadataValue(dto.invoiceNumber),
+      customerNumber: this.cleanManualMetadataValue(dto.customerNumber),
+      accountNumber: this.cleanManualMetadataValue(dto.accountNumber),
+    };
     const shouldUpdateTitle = nextTitle !== undefined && (document.title ?? document.fileName) !== nextTitle;
     const shouldUpdateTags = dto.tags !== undefined && !this.sameTags(document.tags ?? [], nextTags);
     const shouldUpdateSentAt =
       dto.sentAt !== undefined &&
       (formatSentDate(document.sentAt) !== formatSentDate(nextSentAt) || document.hasSentDate !== Boolean(nextSentAt));
+    const shouldClearMetadata = dto.clearMetadata === true;
+    const shouldUpdateMetadata = hasMetadataUpdate;
 
     const chunks = await this.chunkModel
       .find({ metadataId: new Types.ObjectId(id), deleted: false })
@@ -185,11 +218,38 @@ export class DocumentsService {
       const metadataSet = {
         ...(shouldUpdateTitle ? { title: nextTitle } : {}),
         ...(shouldUpdateTags ? { tags: nextTags } : {}),
-        ...(shouldUpdateSentAt ? { hasSentDate: Boolean(nextSentAt) } : {}),
-        ...(shouldUpdateSentAt && nextSentAt ? { sentAt: nextSentAt } : {}),
+        ...(shouldClearMetadata ? { hasSentDate: false } : shouldUpdateSentAt ? { hasSentDate: Boolean(nextSentAt) } : {}),
+        ...(!shouldClearMetadata && shouldUpdateSentAt && nextSentAt ? { sentAt: nextSentAt } : {}),
+        ...Object.fromEntries(
+          Object.entries(metadataStringUpdates).filter(([field, value]) => dto[field as keyof UpdateDocumentDto] !== undefined && value),
+        ),
+        ...(dto.deadlineAt !== undefined && nextDeadlineAt ? { deadlineAt: nextDeadlineAt } : {}),
+        ...(dto.paymentDueAt !== undefined && nextPaymentDueAt ? { paymentDueAt: nextPaymentDueAt } : {}),
       };
       const metadataUnset = {
-        ...(shouldUpdateSentAt && !nextSentAt ? { sentAt: '' } : {}),
+        ...(shouldClearMetadata
+          ? {
+              sentAt: '',
+              sentLocation: '',
+              sender: '',
+              recipient: '',
+              subject: '',
+              referenceNumber: '',
+              invoiceNumber: '',
+              customerNumber: '',
+              accountNumber: '',
+              deadlineAt: '',
+              paymentDueAt: '',
+              letterFieldSources: '',
+            }
+          : {
+              ...(shouldUpdateSentAt && !nextSentAt ? { sentAt: '' } : {}),
+              ...Object.fromEntries(
+                Object.entries(metadataStringUpdates).filter(([field, value]) => dto[field as keyof UpdateDocumentDto] !== undefined && !value),
+              ),
+              ...(dto.deadlineAt !== undefined && !nextDeadlineAt ? { deadlineAt: '' } : {}),
+              ...(dto.paymentDueAt !== undefined && !nextPaymentDueAt ? { paymentDueAt: '' } : {}),
+            }),
       };
       if (Object.keys(metadataSet).length > 0 || Object.keys(metadataUnset).length > 0) {
         await this.metadataModel.updateOne(
@@ -202,15 +262,31 @@ export class DocumentsService {
         );
       }
 
-      if (chunks.length > 0 && (shouldUpdateTitle || shouldUpdateTags)) {
+      if (chunks.length > 0 && (shouldUpdateTitle || shouldUpdateTags || shouldClearMetadata || shouldUpdateMetadata)) {
+        const effectiveLetterFieldsText = shouldClearMetadata
+          ? ''
+          : letterFieldsSearchText({
+              sender: dto.sender !== undefined ? metadataStringUpdates.sender : document.sender,
+              recipient: dto.recipient !== undefined ? metadataStringUpdates.recipient : document.recipient,
+              sentLocation: dto.sentLocation !== undefined ? metadataStringUpdates.sentLocation : document.sentLocation,
+              subject: dto.subject !== undefined ? metadataStringUpdates.subject : document.subject,
+              referenceNumber: dto.referenceNumber !== undefined ? metadataStringUpdates.referenceNumber : document.referenceNumber,
+              invoiceNumber: dto.invoiceNumber !== undefined ? metadataStringUpdates.invoiceNumber : document.invoiceNumber,
+              customerNumber: dto.customerNumber !== undefined ? metadataStringUpdates.customerNumber : document.customerNumber,
+              accountNumber: dto.accountNumber !== undefined ? metadataStringUpdates.accountNumber : document.accountNumber,
+            });
+        const letterFieldTerms = normalizeTerms(effectiveLetterFieldsText);
+        const letterFieldPartialTerms = buildPartialTerms(effectiveLetterFieldsText);
         await this.chunkModel.bulkWrite(
           chunks.map((chunk) => ({
             updateOne: {
               filter: { _id: chunk._id },
               update: {
                 $set: {
-                  terms: Array.from(new Set([...normalizeTerms(chunk.text), ...normalizeTerms(chunk.fileName), ...titleTerms])),
-                  partialTerms: Array.from(new Set([...buildPartialTerms(chunk.text), ...buildPartialTerms(chunk.fileName), ...titlePartialTerms])),
+                  terms: Array.from(new Set([...normalizeTerms(chunk.text), ...normalizeTerms(chunk.fileName), ...titleTerms, ...letterFieldTerms])),
+                  partialTerms: Array.from(
+                    new Set([...buildPartialTerms(chunk.text), ...buildPartialTerms(chunk.fileName), ...titlePartialTerms, ...letterFieldPartialTerms]),
+                  ),
                   tags: nextTags,
                 },
               },
@@ -221,8 +297,8 @@ export class DocumentsService {
       }
     });
 
-    const effectiveSentAt = dto.sentAt === undefined ? document.sentAt : nextSentAt;
-    const effectiveHasSentDate = dto.sentAt === undefined ? document.hasSentDate ?? Boolean(document.sentAt) : Boolean(effectiveSentAt);
+    const effectiveSentAt = shouldClearMetadata ? undefined : dto.sentAt === undefined ? document.sentAt : nextSentAt;
+    const effectiveHasSentDate = shouldClearMetadata ? false : dto.sentAt === undefined ? document.hasSentDate ?? Boolean(document.sentAt) : Boolean(effectiveSentAt);
     return {
       documentId: id,
       title: effectiveTitle,
@@ -231,6 +307,14 @@ export class DocumentsService {
       sentAt: formatSentDate(effectiveSentAt),
       hasSentDate: effectiveHasSentDate,
     };
+  }
+
+  private cleanManualMetadataValue(value: string | null | undefined): string | undefined {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    const cleaned = value.replace(/\r\n/g, '\n').trim();
+    return cleaned.length > 0 ? cleaned : undefined;
   }
 
   async getPdfLink(id: string) {
@@ -755,10 +839,13 @@ export class DocumentsService {
       await this.throwIfSyncStopRequested();
 
       const analyzedText = spellchecked.text;
-      const sentAt = detectSentDate(analyzedText, language);
-      const letterMetadata = extractLetterMetadata(analyzedText, language, extracted.layoutPages);
+      const letterAnalysisText =
+        this.ocrDetectionTextStrategy() === 'GROUPS' ? this.layoutPagesText(extracted.layoutPages) || analyzedText : analyzedText;
+      const sentAt = detectSentDate(letterAnalysisText, language);
+      const letterMetadata = extractLetterMetadata(letterAnalysisText, language, extracted.layoutPages);
       const letterFields = letterMetadata.fields;
       this.logExtractedLetterMetadata(sourceFile.name, letterMetadata);
+      await this.pdfText.annotateMetadataDebug(extracted.debugDir, extracted.layoutPages, letterMetadata);
       const chunks = chunkText(analyzedText);
       const vectorSearchEnabled = this.isVectorSearchEnabled();
       if (vectorSearchEnabled) {
@@ -859,6 +946,7 @@ export class DocumentsService {
     return {
       ...(fields.sender ? { sender: fields.sender } : {}),
       ...(fields.recipient ? { recipient: fields.recipient } : {}),
+      ...(fields.sentLocation ? { sentLocation: fields.sentLocation } : {}),
       ...(fields.subject ? { subject: fields.subject } : {}),
       ...(fields.referenceNumber ? { referenceNumber: fields.referenceNumber } : {}),
       ...(fields.invoiceNumber ? { invoiceNumber: fields.invoiceNumber } : {}),
@@ -873,6 +961,7 @@ export class DocumentsService {
     return {
       ...(fields.sender ? {} : { sender: '' }),
       ...(fields.recipient ? {} : { recipient: '' }),
+      ...(fields.sentLocation ? {} : { sentLocation: '' }),
       ...(fields.subject ? {} : { subject: '' }),
       ...(fields.referenceNumber ? {} : { referenceNumber: '' }),
       ...(fields.invoiceNumber ? {} : { invoiceNumber: '' }),
@@ -881,6 +970,19 @@ export class DocumentsService {
       ...(fields.deadlineAt ? {} : { deadlineAt: '' }),
       ...(fields.paymentDueAt ? {} : { paymentDueAt: '' }),
     };
+  }
+
+  private ocrDetectionTextStrategy(): 'TEXTS' | 'GROUPS' {
+    return this.config.get<string>('OCR_DETECTION_TEXT_STRATEGY') === 'GROUPS' ? 'GROUPS' : 'TEXTS';
+  }
+
+  private layoutPagesText(layoutPages: LetterLayoutPage[]): string {
+    return layoutPages
+      .flatMap((page) => page.lines)
+      .sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0)
+      .map((line) => line.text.replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
   }
 
   private logExtractedLetterMetadata(fileName: string, metadata: LetterExtractionResult): void {
@@ -901,6 +1003,7 @@ export class DocumentsService {
     return {
       sender: document.sender,
       recipient: document.recipient,
+      sentLocation: document.sentLocation,
       subject: document.subject,
       referenceNumber: document.referenceNumber,
       invoiceNumber: document.invoiceNumber,
