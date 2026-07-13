@@ -58,7 +58,23 @@ const accountPatterns = [
 ];
 const deadlineLabels = /\b(?:frist|deadline|response due|reply by|antwort bis|reponse avant|réponse avant)\b/iu;
 const paymentDueLabels = /\b(?:zahlbar bis|zahlung bis|fällig|faellig|due date|payment due|echeance|échéance)\b/iu;
-const receiverAnchorTerms = ['hänggi', 'hanggi', 'haenggi', 'gablerackerstrasse', '8615', 'wermatswil'];
+const receiverAnchorTerms = [
+  'doris hänggi',
+  'doris hanggi',
+  'doris haenggi',
+  'yannick hänggi',
+  'yannick hanggi',
+  'yannick haenggi',
+  'silvan hänggi',
+  'silvan hanggi',
+  'silvan haenggi',
+  'hänggi',
+  'hanggi',
+  'haenggi',
+  'gablerackerstrasse',
+  '8615',
+  'wermatswil',
+];
 
 export function extractLetterFields(text: string, language: string, layoutPages: LetterLayoutPage[] = []): LetterFields {
   return extractLetterMetadata(text, language, layoutPages).fields;

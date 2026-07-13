@@ -78,7 +78,7 @@ describe('letter extraction utils', () => {
           lines: [
             { text: 'Example Bank AG', x0: 80, y0: 70, x1: 280, y1: 90 },
             { text: 'Main Street 1', x0: 80, y0: 95, x1: 250, y1: 115 },
-            { text: 'Hänggi', x0: 90, y0: 145, x1: 170, y1: 165 },
+            { text: 'Doris Hänggi', x0: 90, y0: 145, x1: 210, y1: 165 },
             { text: 'Gablerackerstrasse 12', x0: 90, y0: 170, x1: 310, y1: 190 },
             { text: '8615 Wermatswil', x0: 90, y0: 195, x1: 270, y1: 215 },
             { text: 'Zurich, 12.07.2026', x0: 640, y0: 120, x1: 820, y1: 140 },
@@ -89,6 +89,21 @@ describe('letter extraction utils', () => {
     );
 
     expect(fields.sender).toBe('Example Bank AG\nMain Street 1');
-    expect(fields.recipient).toBe('Hänggi\nGablerackerstrasse 12\n8615 Wermatswil');
+    expect(fields.recipient).toBe('Doris Hänggi\nGablerackerstrasse 12\n8615 Wermatswil');
+  });
+
+  it.each(['Doris Hänggi', 'Yannick Hänggi', 'Silvan Hänggi'])('recognizes %s as receiver anchor text', (receiverName) => {
+    const fields = extractLetterFields('', 'eng', [
+      {
+        lines: [
+          { text: 'Example Bank AG', x0: 80, y0: 70, x1: 280, y1: 90 },
+          { text: receiverName, x0: 90, y0: 145, x1: 260, y1: 165 },
+          { text: 'Gablerackerstrasse 12', x0: 90, y0: 170, x1: 310, y1: 190 },
+          { text: '8615 Wermatswil', x0: 90, y0: 195, x1: 270, y1: 215 },
+        ],
+      },
+    ]);
+
+    expect(fields.recipient).toBe(`${receiverName}\nGablerackerstrasse 12\n8615 Wermatswil`);
   });
 });
