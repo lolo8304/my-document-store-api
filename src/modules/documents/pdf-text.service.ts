@@ -7,6 +7,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import pdfParse from 'pdf-parse';
 import { createWorker } from 'tesseract.js';
+import { LetterLayoutLine, LetterLayoutPage } from './utils/letter-extraction.utils';
 
 const execFileAsync = promisify(execFile);
 const fixedRotationAngles = [0, 90, 180, 270] as const;
@@ -15,6 +16,26 @@ interface OcrPageResult {
   text: string;
   confidence: number;
   rotationAngle: number;
+  layoutLines: LetterLayoutLine[];
+}
+
+interface OcrProgress {
+  currentPage: number;
+  totalPages: number;
+}
+
+interface OcrBlock {
+  paragraphs: Array<{
+    lines: Array<{
+      text: string;
+      bbox: {
+        x0: number;
+        y0: number;
+        x1: number;
+        y1: number;
+      };
+    }>;
+  }>;
 }
 
 @Injectable()
@@ -23,18 +44,24 @@ export class PdfTextService {
 
   constructor(private readonly config: ConfigService) {}
 
-  async extractText(buffer: Buffer): Promise<{ text: string; source: 'embedded' | 'ocr'; rotationAngle: number }> {
+  async extractText(
+    buffer: Buffer,
+    onOcrProgress?: (progress: OcrProgress) => void | Promise<void>,
+  ): Promise<{ text: string; source: 'embedded' | 'ocr'; rotationAngle: number; layoutPages: LetterLayoutPage[] }> {
     const embedded = await pdfParse(buffer);
     const embeddedText = embedded.text?.trim() ?? '';
     if (embeddedText.length > 50) {
-      return { text: embeddedText, source: 'embedded', rotationAngle: 0 };
+      return { text: embeddedText, source: 'embedded', rotationAngle: 0, layoutPages: [] };
     }
 
-    const ocr = await this.ocrPdf(buffer);
-    return { text: ocr.text, source: 'ocr', rotationAngle: ocr.rotationAngle };
+    const ocr = await this.ocrPdf(buffer, onOcrProgress);
+    return { text: ocr.text, source: 'ocr', rotationAngle: ocr.rotationAngle, layoutPages: ocr.layoutPages };
   }
 
-  private async ocrPdf(buffer: Buffer): Promise<{ text: string; rotationAngle: number }> {
+  private async ocrPdf(
+    buffer: Buffer,
+    onOcrProgress?: (progress: OcrProgress) => void | Promise<void>,
+  ): Promise<{ text: string; rotationAngle: number; layoutPages: LetterLayoutPage[] }> {
     const tempRoot = this.config.get<string>('OCR_TEMP_DIR') ?? '.tmp/ocr';
     const workDir = join(process.cwd(), tempRoot, randomUUID());
     await mkdir(workDir, { recursive: true });
@@ -52,24 +79,38 @@ export class PdfTextService {
       const worker = await createWorker(this.config.get<string>('OCR_LANGUAGES') ?? 'deu+eng+fra');
       try {
         const pages: string[] = [];
-        let rotationAngle = 0;
+        const layoutPages: LetterLayoutPage[] = [];
         const autoRotate = this.config.get<string>('OCR_AUTO_ROTATE') !== 'false';
-        for (const file of files) {
-          const imagePath = join(workDir, file);
-          const autoResult = await worker.recognize(imagePath, { rotateAuto: autoRotate });
-          const pageRotationAngle = this.detectedRotationAngle(file, autoResult.data.rotateRadians);
-          const bestResult = await this.pickBestOcrResult(imagePath, file, {
-            text: autoResult.data.text,
-            confidence: autoResult.data.confidence,
-            rotationAngle: pageRotationAngle,
-          });
 
-          if (Math.abs(bestResult.rotationAngle) > Math.abs(rotationAngle)) {
-            rotationAngle = bestResult.rotationAngle;
-          }
-          pages.push(bestResult.text);
+        if (files.length === 0) {
+          return { text: '', rotationAngle: 0, layoutPages: [] };
         }
-        return { text: pages.join('\n\n').trim(), rotationAngle };
+
+        const [firstFile, ...remainingFiles] = files;
+        const firstImagePath = join(workDir, firstFile);
+        await onOcrProgress?.({ currentPage: 1, totalPages: files.length });
+        const firstAutoResult = await worker.recognize(firstImagePath, { rotateAuto: autoRotate });
+        const firstPageRotationAngle = this.detectedRotationAngle(firstFile, firstAutoResult.data.rotateRadians);
+        const firstBestResult = await this.pickBestOcrResult(firstImagePath, firstFile, {
+          text: firstAutoResult.data.text,
+          confidence: firstAutoResult.data.confidence,
+          rotationAngle: firstPageRotationAngle,
+          layoutLines: this.layoutLines(firstAutoResult.data.blocks),
+        });
+        const rotationAngle = this.normalizeRotationAngle(firstBestResult.rotationAngle);
+        this.logger.log(`OCR applying ${rotationAngle} degree document rotation to ${files.length} page(s)`);
+        pages.push(firstBestResult.text);
+        layoutPages.push({ lines: firstBestResult.layoutLines });
+
+        for (const [index, file] of remainingFiles.entries()) {
+          const imagePath = join(workDir, file);
+          await onOcrProgress?.({ currentPage: index + 2, totalPages: files.length });
+          const fixedResult = await this.recognizeWithWorkerRotation(worker, imagePath, rotationAngle);
+          pages.push(fixedResult.text);
+          layoutPages.push({ lines: fixedResult.layoutLines });
+        }
+
+        return { text: pages.join('\n\n').trim(), rotationAngle, layoutPages };
       } finally {
         await worker.terminate();
       }
@@ -79,6 +120,34 @@ export class PdfTextService {
     } finally {
       await rm(workDir, { recursive: true, force: true });
     }
+  }
+
+  private async recognizeWithWorkerRotation(
+    worker: Awaited<ReturnType<typeof createWorker>>,
+    imagePath: string,
+    rotationAngle: 0 | 90 | 180 | 270,
+  ): Promise<OcrPageResult> {
+    const result = await worker.recognize(imagePath, { rotateRadians: (rotationAngle * Math.PI) / 180 });
+    return {
+      text: result.data.text,
+      confidence: result.data.confidence,
+      rotationAngle,
+      layoutLines: this.layoutLines(result.data.blocks),
+    };
+  }
+
+  private layoutLines(blocks: OcrBlock[] | null): LetterLayoutLine[] {
+    return (blocks ?? []).flatMap((block) =>
+      block.paragraphs.flatMap((paragraph) =>
+        paragraph.lines.map((line) => ({
+          text: line.text,
+          x0: line.bbox.x0,
+          y0: line.bbox.y0,
+          x1: line.bbox.x1,
+          y1: line.bbox.y1,
+        })),
+      ),
+    );
   }
 
   private detectedRotationAngle(fileName: string, rotateRadians: number | null): number {
@@ -119,6 +188,7 @@ export class PdfTextService {
         text: result.data.text,
         confidence: result.data.confidence,
         rotationAngle,
+        layoutLines: this.layoutLines(result.data.blocks),
       };
     } finally {
       await worker.terminate();

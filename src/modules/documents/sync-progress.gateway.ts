@@ -13,6 +13,9 @@ export interface SyncProgressEvent {
   phase?: 'idle' | 'listing' | 'checking' | 'downloading' | 'extracting' | 'spellchecking' | 'embedding' | 'storing' | 'deleting';
   fileName?: string;
   fileElapsedSeconds?: number;
+  stepCurrent?: number;
+  stepTotal?: number;
+  stepUnit?: 'page' | 'chunk';
   startedAt?: string;
   error?: string;
 }

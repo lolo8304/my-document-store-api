@@ -44,6 +44,15 @@ export class SyncLock {
   @Prop()
   fileElapsedSeconds?: number;
 
+  @Prop()
+  stepCurrent?: number;
+
+  @Prop()
+  stepTotal?: number;
+
+  @Prop({ enum: ['page', 'chunk'] })
+  stepUnit?: 'page' | 'chunk';
+
   @Prop({ default: 0 })
   imported: number;
 

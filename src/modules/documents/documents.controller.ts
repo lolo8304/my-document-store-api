@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiKeyGuard } from '../../common/auth/api-key.guard';
 import { SearchDocumentsDto } from './dto/search-documents.dto';
 import { UpdateDocumentDto } from './dto/update-document.dto';
@@ -33,6 +33,11 @@ export class DocumentsController {
   @Patch(':id')
   updateDocument(@Param('id') id: string, @Body() body: UpdateDocumentDto) {
     return this.documents.updateDocument(id, body);
+  }
+
+  @Post(':id/reprocess-ocr')
+  reprocessOcr(@Param('id') id: string) {
+    return this.documents.reprocessDocumentOcr(id);
   }
 
   @Get(':id/text')

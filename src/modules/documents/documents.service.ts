@@ -15,6 +15,7 @@ import { DocumentChunk } from './schemas/document-chunk.schema';
 import { DocumentsMetadata } from './schemas/documents-metadata.schema';
 import { SyncLock } from './schemas/sync-lock.schema';
 import { SyncProgressEvent, SyncProgressGateway } from './sync-progress.gateway';
+import { extractLetterMetadata, LetterExtractionResult, LetterFields, letterFieldsSearchText } from './utils/letter-extraction.utils';
 import { detectSentDate, formatSentDate, parseSentDateInput } from './utils/sent-date.utils';
 import { buildExcerpt, buildMultiTermExcerpt, buildPartialTerms, chunkText, mergeOverlappingChunks, normalizeTerms } from './utils/text.utils';
 import { SettingsService } from '../settings/settings.service';
@@ -110,6 +111,7 @@ export class DocumentsService {
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
           sentAt: formatSentDate(document.sentAt),
           hasSentDate: document.hasSentDate ?? false,
+          ...this.letterFieldResult(document),
           excerpt: text.length > 160 ? `${text.slice(0, 160)}...` : text,
           matchedTerms: [],
           textUrl: `/documents/${document._id}/text`,
@@ -142,6 +144,9 @@ export class DocumentsService {
       title: document.title ?? document.fileName,
       fileName: document.fileName,
       tags: document.tags ?? [],
+      sentAt: formatSentDate(document.sentAt),
+      hasSentDate: document.hasSentDate ?? false,
+      ...this.letterFieldResult(document),
       text: mergeOverlappingChunks(chunks.map((chunk) => chunk.text)),
     };
   }
@@ -233,6 +238,22 @@ export class DocumentsService {
     const pdfUrl = await this.dropbox.getDirectDownloadLink(document.dropboxPath);
     await this.metadataModel.updateOne({ _id: id }, { $set: { pdfUrl } });
     return { documentId: id, pdfUrl };
+  }
+
+  async reprocessDocumentOcr(id: string): Promise<{ documentId: string; started: true }> {
+    await this.getDocument(id);
+    await this.metadataModel.updateOne(
+      { _id: id },
+      {
+        $set: {
+          status: 'failed',
+          spellcheckCorrections: -1,
+          error: 'Re-OCR requested',
+        },
+      },
+    );
+    await this.startDropboxSync();
+    return { documentId: id, started: true };
   }
 
   async startDropboxSync(): Promise<{ started: true }> {
@@ -454,6 +475,9 @@ export class DocumentsService {
         phase: syncLock?.phase,
         fileName: syncLock?.fileName,
         fileElapsedSeconds: syncLock?.fileElapsedSeconds,
+        stepCurrent: syncLock?.stepCurrent,
+        stepTotal: syncLock?.stepTotal,
+        stepUnit: syncLock?.stepUnit,
       },
     };
   }
@@ -565,6 +589,12 @@ export class DocumentsService {
   }
 
   private async updateSyncProgress(progress: SyncProgressEvent): Promise<void> {
+    const unsetFields = {
+      ...(progress.fileName ? {} : { fileName: '', fileElapsedSeconds: '' }),
+      ...(progress.stepCurrent !== undefined && progress.stepTotal !== undefined && progress.stepUnit !== undefined
+        ? {}
+        : { stepCurrent: '', stepTotal: '', stepUnit: '' }),
+    };
     const startedAt = await this.syncLockModel
       .findOneAndUpdate(
         { name: this.dropboxSyncLockName, ownerInstanceId: this.syncOwnerInstanceId },
@@ -582,8 +612,11 @@ export class DocumentsService {
             heartbeatAt: new Date(),
             ...(progress.fileName ? { fileName: progress.fileName } : {}),
             ...(progress.fileElapsedSeconds !== undefined ? { fileElapsedSeconds: progress.fileElapsedSeconds } : {}),
+            ...(progress.stepCurrent !== undefined ? { stepCurrent: progress.stepCurrent } : {}),
+            ...(progress.stepTotal !== undefined ? { stepTotal: progress.stepTotal } : {}),
+            ...(progress.stepUnit !== undefined ? { stepUnit: progress.stepUnit } : {}),
           },
-          ...(progress.fileName ? {} : { $unset: { fileName: '', fileElapsedSeconds: '' } }),
+          ...(Object.keys(unsetFields).length > 0 ? { $unset: unsetFields } : {}),
         },
         { new: true },
       )
@@ -705,7 +738,13 @@ export class DocumentsService {
       await this.throwIfSyncStopRequested();
 
       await this.emitImportPhase('extracting', sourceFile.name, counters, fileStartedAt);
-      const extracted = await this.pdfText.extractText(pdf);
+      const extracted = await this.pdfText.extractText(pdf, (progress) =>
+        this.emitImportPhase('extracting', sourceFile.name, counters, fileStartedAt, {
+          stepCurrent: progress.currentPage,
+          stepTotal: progress.totalPages,
+          stepUnit: 'page',
+        }),
+      );
       const extractedText = extracted.source === 'ocr' ? this.cleanOcrNoise(extracted.text, sourceFile.name) : extracted.text;
       await this.throwIfSyncStopRequested();
 
@@ -717,18 +756,27 @@ export class DocumentsService {
 
       const analyzedText = spellchecked.text;
       const sentAt = detectSentDate(analyzedText, language);
+      const letterMetadata = extractLetterMetadata(analyzedText, language, extracted.layoutPages);
+      const letterFields = letterMetadata.fields;
+      this.logExtractedLetterMetadata(sourceFile.name, letterMetadata);
       const chunks = chunkText(analyzedText);
       const vectorSearchEnabled = this.isVectorSearchEnabled();
       if (vectorSearchEnabled) {
-        await this.emitImportPhase('embedding', sourceFile.name, counters, fileStartedAt);
+        await this.emitChunkPhaseProgress('embedding', sourceFile.name, counters, fileStartedAt, chunks.length, 1);
         await this.throwIfSyncStopRequested();
       }
       const vectors = vectorSearchEnabled ? await this.embeddings.embedMany(chunks) : [];
+      if (vectorSearchEnabled) {
+        await this.emitChunkPhaseProgress('embedding', sourceFile.name, counters, fileStartedAt, chunks.length, chunks.length);
+      }
       await this.throwIfSyncStopRequested();
 
-      await this.emitImportPhase('storing', sourceFile.name, counters, fileStartedAt);
+      await this.emitChunkPhaseProgress('storing', sourceFile.name, counters, fileStartedAt, chunks.length, 1);
       const fileNameTerms = normalizeTerms(sourceFile.name);
       const fileNamePartialTerms = buildPartialTerms(sourceFile.name);
+      const letterFieldsText = letterFieldsSearchText(letterFields);
+      const letterFieldTerms = normalizeTerms(letterFieldsText);
+      const letterFieldPartialTerms = buildPartialTerms(letterFieldsText);
       const titleTerms = metadata.title ? normalizeTerms(metadata.title) : [];
       const titlePartialTerms = metadata.title ? buildPartialTerms(metadata.title) : [];
       const tags = metadata.tags ?? [];
@@ -741,17 +789,22 @@ export class DocumentsService {
           fileName: sourceFile.name,
           chunkIndex: index,
           text,
-          terms: Array.from(new Set([...normalizeTerms(text), ...fileNameTerms, ...titleTerms])),
-          partialTerms: Array.from(new Set([...buildPartialTerms(text), ...fileNamePartialTerms, ...titlePartialTerms])),
+          terms: Array.from(new Set([...normalizeTerms(text), ...fileNameTerms, ...titleTerms, ...letterFieldTerms])),
+          partialTerms: Array.from(
+            new Set([...buildPartialTerms(text), ...fileNamePartialTerms, ...titlePartialTerms, ...letterFieldPartialTerms]),
+          ),
           tags,
           ...(vectorSearchEnabled ? { embedding: vectors[index] } : {}),
           deleted: false,
         })),
       );
+      await this.emitChunkPhaseProgress('storing', sourceFile.name, counters, fileStartedAt, chunks.length, chunks.length);
 
       const pdfUrl = await this.dropbox.getDirectDownloadLink(sourceFile.pathDisplay);
       const preservedSentAt = metadata.sentAt;
-      const effectiveSentAt = preservedSentAt ?? sentAt;
+      const effectiveSentAt = preservedSentAt ?? letterFields.sentAt ?? sentAt;
+      const letterFieldSet = this.letterFieldMetadataSet(letterFields);
+      const letterFieldUnset = this.letterFieldMetadataUnset(letterFields);
       await this.metadataModel.updateOne(
         { _id: metadata._id },
         {
@@ -765,9 +818,11 @@ export class DocumentsService {
             modifiedAtDropbox: this.syncDate(sourceFile),
             hasSentDate: Boolean(effectiveSentAt),
             ...(effectiveSentAt ? { sentAt: effectiveSentAt } : {}),
+            ...letterFieldSet,
+            letterFieldSources: letterMetadata.sources,
             pdfUrl,
           },
-          $unset: { error: '', ...(effectiveSentAt ? {} : { sentAt: '' }) },
+          $unset: { error: '', ...(effectiveSentAt ? {} : { sentAt: '' }), ...letterFieldUnset },
         },
       );
     } catch (error) {
@@ -787,6 +842,7 @@ export class DocumentsService {
     fileName: string,
     counters: SyncCounters,
     fileStartedAt: number,
+    progressDetails: Pick<SyncProgressEvent, 'stepCurrent' | 'stepTotal' | 'stepUnit'> = {},
   ) {
     await this.updateSyncProgress({
       running: true,
@@ -795,7 +851,87 @@ export class DocumentsService {
       phase,
       fileName,
       fileElapsedSeconds: Math.max(0, Math.round((Date.now() - fileStartedAt) / 1000)),
+      ...progressDetails,
     });
+  }
+
+  private letterFieldMetadataSet(fields: LetterFields): Partial<DocumentsMetadata> {
+    return {
+      ...(fields.sender ? { sender: fields.sender } : {}),
+      ...(fields.recipient ? { recipient: fields.recipient } : {}),
+      ...(fields.subject ? { subject: fields.subject } : {}),
+      ...(fields.referenceNumber ? { referenceNumber: fields.referenceNumber } : {}),
+      ...(fields.invoiceNumber ? { invoiceNumber: fields.invoiceNumber } : {}),
+      ...(fields.customerNumber ? { customerNumber: fields.customerNumber } : {}),
+      ...(fields.accountNumber ? { accountNumber: fields.accountNumber } : {}),
+      ...(fields.deadlineAt ? { deadlineAt: fields.deadlineAt } : {}),
+      ...(fields.paymentDueAt ? { paymentDueAt: fields.paymentDueAt } : {}),
+    };
+  }
+
+  private letterFieldMetadataUnset(fields: LetterFields): Record<string, ''> {
+    return {
+      ...(fields.sender ? {} : { sender: '' }),
+      ...(fields.recipient ? {} : { recipient: '' }),
+      ...(fields.subject ? {} : { subject: '' }),
+      ...(fields.referenceNumber ? {} : { referenceNumber: '' }),
+      ...(fields.invoiceNumber ? {} : { invoiceNumber: '' }),
+      ...(fields.customerNumber ? {} : { customerNumber: '' }),
+      ...(fields.accountNumber ? {} : { accountNumber: '' }),
+      ...(fields.deadlineAt ? {} : { deadlineAt: '' }),
+      ...(fields.paymentDueAt ? {} : { paymentDueAt: '' }),
+    };
+  }
+
+  private logExtractedLetterMetadata(fileName: string, metadata: LetterExtractionResult): void {
+    for (const [field, value] of Object.entries(metadata.fields)) {
+      const source = metadata.sources[field as keyof LetterFields];
+      if (!source) {
+        continue;
+      }
+      const displayValue = value instanceof Date ? formatSentDate(value) : String(value);
+      this.logger.log(
+        `Letter metadata found for ${fileName}: ${field}="${displayValue}" via ${source.method} at ${source.location}` +
+          (source.detail ? ` (${source.detail})` : ''),
+      );
+    }
+  }
+
+  private letterFieldResult(document: DocumentsMetadata) {
+    return {
+      sender: document.sender,
+      recipient: document.recipient,
+      subject: document.subject,
+      referenceNumber: document.referenceNumber,
+      invoiceNumber: document.invoiceNumber,
+      customerNumber: document.customerNumber,
+      accountNumber: document.accountNumber,
+      deadlineAt: formatSentDate(document.deadlineAt),
+      paymentDueAt: formatSentDate(document.paymentDueAt),
+    };
+  }
+
+  private async emitChunkPhaseProgress(
+    phase: 'embedding' | 'storing',
+    fileName: string,
+    counters: SyncCounters,
+    fileStartedAt: number,
+    totalChunks: number,
+    currentChunk: number,
+  ) {
+    await this.emitImportPhase(
+      phase,
+      fileName,
+      counters,
+      fileStartedAt,
+      totalChunks > 0
+        ? {
+            stepCurrent: Math.min(Math.max(currentChunk, 1), totalChunks),
+            stepTotal: totalChunks,
+            stepUnit: 'chunk',
+          }
+        : {},
+    );
   }
 
   private async throwIfSyncStopRequested(): Promise<void> {
@@ -1105,6 +1241,7 @@ export class DocumentsService {
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
           sentAt: formatSentDate(document.sentAt),
           hasSentDate: document.hasSentDate ?? false,
+          ...this.letterFieldResult(document),
           excerpt: text.length > 160 ? `${text.slice(0, 160)}...` : text,
           matchedTerms: [],
           textUrl: `/documents/${document._id}/text`,
@@ -1365,6 +1502,7 @@ export class DocumentsService {
           modifiedAt: document.modifiedAtDropbox?.toISOString(),
           sentAt: formatSentDate(document.sentAt),
           hasSentDate: document.hasSentDate ?? false,
+          ...this.letterFieldResult(document),
           excerpt: result.bestMatchCount ? buildMultiTermExcerpt(chunks.map((item: DocumentChunk) => item.text), terms) : buildExcerpt(chunk.text, terms),
           matchedTerms: matchedTerms.length > 0 ? matchedTerms : terms.filter((term) => chunk.terms?.includes(term)),
           textUrl: `/documents/${document._id}/text`,

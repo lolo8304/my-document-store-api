@@ -57,6 +57,36 @@ export class DocumentsMetadata {
   hasSentDate?: boolean;
 
   @Prop()
+  sender?: string;
+
+  @Prop()
+  recipient?: string;
+
+  @Prop()
+  subject?: string;
+
+  @Prop()
+  referenceNumber?: string;
+
+  @Prop()
+  invoiceNumber?: string;
+
+  @Prop()
+  customerNumber?: string;
+
+  @Prop()
+  accountNumber?: string;
+
+  @Prop()
+  deadlineAt?: Date;
+
+  @Prop()
+  paymentDueAt?: Date;
+
+  @Prop({ type: Object })
+  letterFieldSources?: Record<string, { method: string; location: string; detail?: string }>;
+
+  @Prop()
   processedAt?: Date;
 
   @Prop()

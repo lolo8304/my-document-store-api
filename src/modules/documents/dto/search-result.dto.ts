@@ -8,6 +8,15 @@ export interface SearchResultItem {
   modifiedAt?: string;
   sentAt?: string;
   hasSentDate: boolean;
+  sender?: string;
+  recipient?: string;
+  subject?: string;
+  referenceNumber?: string;
+  invoiceNumber?: string;
+  customerNumber?: string;
+  accountNumber?: string;
+  deadlineAt?: string;
+  paymentDueAt?: string;
   excerpt: string;
   matchedTerms: string[];
   textUrl: string;
